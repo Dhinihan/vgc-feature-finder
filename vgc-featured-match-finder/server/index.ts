@@ -48,6 +48,17 @@ const REFRESH_RUN_LIMIT = 20;
 const WILDCARD_COUNTRY = "*";
 const MAX_PERSISTED_PAYLOAD_BYTES = 60_000;
 
+function championshipPointsDivisionLabel(division: string): string {
+  const normalized = division.trim().toLowerCase();
+  if (normalized === "juniors") {
+    return "Juniors";
+  }
+  if (normalized === "seniors") {
+    return "Seniors";
+  }
+  return "Masters";
+}
+
 type ServerContext = {
   auth: { userId: string };
   db: Record<string, TableApi>;
@@ -333,8 +344,15 @@ function isPayloadCacheFresh(row: TableRow | null, ttlMs: number): boolean {
 
 function championshipPointsCacheFresh(ctx: ServerContext): boolean {
   const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.championshipPoints, "");
-  const hasRows = ctx.db.championshipPointsPlayers.all().length > 0;
-  return hasRows && isPayloadCacheFresh(cached, CP_CACHE_MS);
+  const rowCount = ctx.db.championshipPointsPlayers.all().length;
+  if (rowCount === 0) {
+    return false;
+  }
+  // Demo / partial imports should not block a full refresh
+  if (rowCount < 100) {
+    return false;
+  }
+  return isPayloadCacheFresh(cached, CP_CACHE_MS);
 }
 
 function pairingsCacheFresh(ctx: ServerContext, eventId: string): boolean {
@@ -345,7 +363,10 @@ function pairingsCacheFresh(ctx: ServerContext, eventId: string): boolean {
   return isPayloadCacheFresh(cached, PAIRINGS_CACHE_MS);
 }
 
-async function fetchChampionshipPointsPayload(ctx: ServerContext): Promise<string> {
+async function fetchChampionshipPointsPayload(
+  ctx: ServerContext,
+  divisionLabel: string
+): Promise<string> {
   const chunks: string[] = [];
 
   for (const region of SOURCES.championshipPointsRegions) {
@@ -353,7 +374,7 @@ async function fetchChampionshipPointsPayload(ctx: ServerContext): Promise<strin
       const body = await fetchText(SOURCES.championshipPointsUrl, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
-        body: `type=VG&region=${encodeURIComponent(region)}`
+        body: `type=VG&region=${encodeURIComponent(region)}&division=${encodeURIComponent(divisionLabel)}`
       });
 
       if (body.includes("<tr") || body.includes("player(")) {
@@ -362,6 +383,7 @@ async function fetchChampionshipPointsPayload(ctx: ServerContext): Promise<strin
     } catch (error) {
       ctx.log.warn("championship points region fetch failed", {
         region,
+        division: divisionLabel,
         message: error instanceof Error ? error.message : String(error)
       });
     }
@@ -377,7 +399,7 @@ function normalizeCountryForStorage(country: string): string {
 function persistChampionshipPoints(
   ctx: ServerContext,
   players: ChampionshipPointsPlayer[],
-  payload: string
+  cacheMeta: { division: string }
 ): { playerCount: number; sourceUpdatedAt: string } {
   const existing = ctx.db.championshipPointsPlayers.all();
   deleteAllRows(ctx, "championshipPointsPlayers", existing);
@@ -390,12 +412,21 @@ function persistChampionshipPoints(
       displayName: player.displayName,
       country: normalizeCountryForStorage(player.country),
       championshipPoints: String(player.championshipPoints),
-      source: "pokemon-leaderboard",
+      source: "pokedata-2026",
       sourceUpdatedAt: updatedAt
     });
   }
 
-  replaceSourcePayload(ctx, "championship-points", "", payload.slice(0, 500_000));
+  replaceSourcePayload(
+    ctx,
+    PAYLOAD_SOURCE.championshipPoints,
+    "",
+    JSON.stringify({
+      division: cacheMeta.division,
+      playerCount: players.length,
+      importedAt: updatedAt
+    })
+  );
 
   return { playerCount: players.length, sourceUpdatedAt: updatedAt };
 }
@@ -428,21 +459,32 @@ async function importChampionshipPoints(
     };
   }
 
-  const payload = await fetchChampionshipPointsPayload(ctx);
+  const activeEvent = getActiveEvent(ctx);
+  const divisionLabel = championshipPointsDivisionLabel(
+    activeEvent ? String(activeEvent.division) : "masters"
+  );
+
+  const payload = await fetchChampionshipPointsPayload(ctx, divisionLabel);
   const players = parseChampionshipPointsPayload(payload);
 
   if (players.length === 0) {
-    if (ctx.env.USE_DEMO_CP_FALLBACK === "true") {
-      ctx.log.warn("using demo championship points fixture", {});
+    const allowDemoFallback = ctx.env.USE_DEMO_CP_FALLBACK !== "false";
+    if (allowDemoFallback) {
+      ctx.log.warn("using demo championship points fixture", { division: divisionLabel });
       const demoPlayers = parseChampionshipPointsPayload(DEMO_CHAMPIONSHIP_POINTS_JSON);
-      const result = persistChampionshipPoints(ctx, demoPlayers, DEMO_CHAMPIONSHIP_POINTS_JSON);
+      const result = persistChampionshipPoints(ctx, demoPlayers, { division: divisionLabel });
       return { ...result, fromCache: false };
     }
 
     throw new Error("no championship points parsed from source");
   }
 
-  const result = persistChampionshipPoints(ctx, players, payload);
+  ctx.log.info("championship points imported", {
+    division: divisionLabel,
+    playerCount: players.length
+  });
+
+  const result = persistChampionshipPoints(ctx, players, { division: divisionLabel });
   return { ...result, fromCache: false };
 }
 
@@ -794,7 +836,7 @@ export default capsule({
       serverCtx.log.info("championship points refresh started", {});
 
       try {
-        const result = await importChampionshipPoints(serverCtx);
+        const result = await importChampionshipPoints(serverCtx, { force: true });
 
         serverCtx.log.info("championship points refresh completed", {
           playerCount: result.playerCount

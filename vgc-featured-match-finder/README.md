@@ -46,6 +46,6 @@ npx lakebed deploy
 ## Fontes
 
 - Partidas: `standingsVGC/{eventId}/{division}/*.json`
-- CPs: PokéData `/2026/` (todas as regiões)
+- CPs: PokéData `/2026/` (VG, divisão do evento, todas as regiões NA/EU/LA/AP/SO/RU)
 
 Exemplo evento recente: **Indianapolis** → `0000187`

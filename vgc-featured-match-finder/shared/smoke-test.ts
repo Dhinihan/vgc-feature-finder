@@ -136,6 +136,11 @@ export function runSmokeTests(): string[] {
   const parsedRound = parsePairingsPayload(pairingsPayload);
   assert(parsedRound.pairings.length === 1, "pairings dedupe");
 
+
+  const cpHtml = `<tr><td>1</td><td><div class="player">Dylan Matthews</div></td><td><div class="country">USA</div></td><td class="point"><div class="cp">1332</div><div class="pp">30</div></td></tr>`;
+  const fromHtml = parseChampionshipPointsPayload(cpHtml);
+  assert(fromHtml.length === 1 && fromHtml[0].championshipPoints === 1332, "cp html uses .cp not .pp");
+
   results.push("all smoke tests passed");
   return results;
 }

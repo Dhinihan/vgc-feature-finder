@@ -111,56 +111,42 @@ function parseChampionshipPointsJson(payload: string): ChampionshipPointsPlayer[
 
 function parseChampionshipPointsHtml(payload: string): ChampionshipPointsPlayer[] {
   const players: ChampionshipPointsPlayer[] = [];
-
-  const rowPattern =
-    /<tr[^>]*>[\s\S]*?<\/tr>/gi;
+  const rowPattern = /<tr[^>]*>[\s\S]*?<\/tr>/gi;
   const rows = payload.match(rowPattern) ?? [];
 
   for (const row of rows) {
-    const nameMatch = row.match(/>([^<]{2,80})<\/td>/i);
-    const cpMatch =
-      row.match(/class="pp"[^>]*>\s*([\d,]+)/i) ??
-      row.match(/class="cp"[^>]*>[\s\S]*?([\d,]+)/i);
+    const nameMatch =
+      row.match(/class="player"[^>]*>([^<]+)</i) ?? row.match(/onclick="player\('([^']+)'/i);
 
-    if (!nameMatch || !cpMatch) {
+    if (!nameMatch) {
       continue;
     }
 
-    const label = parsePlayerLabel(nameMatch[1].replace(/&amp;/g, "&").trim());
-    const points = parsePositiveInt(cpMatch[1]);
+    const displayName = nameMatch[1].replace(/&amp;/g, "&").trim();
+    if (!displayName || /^\d+$/.test(displayName)) {
+      continue;
+    }
 
-    if (!label.displayName || points === null) {
+    const countryMatch = row.match(/class="country">([^<]+)</i);
+    const country = (countryMatch?.[1] ?? "").trim().toUpperCase();
+
+    // PokéData shows current Championship Points in the first `.cp` cell (`.pp` is Play Points).
+    const cpMatch = row.match(/class="cp">([\d,]+)</i);
+    if (!cpMatch) {
+      continue;
+    }
+
+    const points = parsePositiveInt(cpMatch[1]);
+    if (points === null) {
       continue;
     }
 
     players.push({
-      displayName: label.displayName,
-      normalizedName: normalizePlayerName(label.displayName),
-      country: label.country,
+      displayName,
+      normalizedName: normalizePlayerName(displayName),
+      country,
       championshipPoints: points
     });
-  }
-
-  const onclickMatches = payload.matchAll(/player\(\s*'([^']+)'\s*,\s*'([^']*)'/g);
-
-  for (const match of onclickMatches) {
-    const label = parsePlayerLabel(match[1]);
-    const country = match[2].trim().toUpperCase() || label.country;
-    const index = match.index ?? 0;
-    const nearby = payload.slice(index, index + 400);
-    const cpMatch = nearby.match(/class="pp"[^>]*>\s*([\d,]+)/i);
-
-    if (cpMatch) {
-      const points = parsePositiveInt(cpMatch[1]);
-      if (points !== null) {
-        players.push({
-          displayName: label.displayName,
-          normalizedName: normalizePlayerName(label.displayName),
-          country,
-          championshipPoints: points
-        });
-      }
-    }
   }
 
   return dedupeChampionshipPoints(players);

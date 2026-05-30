@@ -1,17 +1,8 @@
 import type { ChampionshipPointsMatch, ChampionshipPointsPlayer, PlayerOverride } from "./domain";
+import { countryCodesMatch } from "./normalize-country";
 import { normalizePlayerName } from "./normalize-player-name";
 
 const WILDCARD_COUNTRY = "*";
-
-function countryMatches(stored: string, playerCountry: string): boolean {
-  if (stored === WILDCARD_COUNTRY || playerCountry === WILDCARD_COUNTRY) {
-    return true;
-  }
-  if (!stored || !playerCountry) {
-    return true;
-  }
-  return stored.toUpperCase() === playerCountry.toUpperCase();
-}
 
 export function matchPlayerToChampionshipPoints(
   displayName: string,
@@ -25,14 +16,14 @@ export function matchPlayerToChampionshipPoints(
   const override = overrides.find(
     (row) =>
       row.tournamentNormalizedName === normalizedName &&
-      countryMatches(row.tournamentCountry, playerCountry)
+      countryCodesMatch(row.tournamentCountry, playerCountry)
   );
 
   if (override) {
     const target = leaderboard.find(
       (entry) =>
         entry.normalizedName === override.leaderboardNormalizedName &&
-        countryMatches(override.leaderboardCountry, entry.country)
+        countryCodesMatch(override.leaderboardCountry, entry.country)
     );
 
     if (target) {
@@ -49,7 +40,7 @@ export function matchPlayerToChampionshipPoints(
   const exactMatches = leaderboard.filter(
     (entry) =>
       entry.normalizedName === normalizedName &&
-      countryMatches(entry.country, playerCountry)
+      countryCodesMatch(entry.country, playerCountry)
   );
 
   if (exactMatches.length === 1) {
@@ -94,8 +85,66 @@ export function matchPlayerToChampionshipPoints(
     };
   }
 
+
+  const tokenKey = firstLastKey(displayName);
+  if (tokenKey.includes("|")) {
+    const tokenMatches = leaderboard.filter(
+      (entry) =>
+        firstLastKey(entry.displayName) === tokenKey &&
+        countryCodesMatch(entry.country, playerCountry)
+    );
+
+    if (tokenMatches.length === 1) {
+      return {
+        championshipPoints: tokenMatches[0].championshipPoints,
+        match: {
+          status: "normalized-name",
+          leaderboardDisplayName: tokenMatches[0].displayName
+        }
+      };
+    }
+
+    const tokenNameOnly = leaderboard.filter((entry) => firstLastKey(entry.displayName) === tokenKey);
+    if (tokenNameOnly.length === 1) {
+      return {
+        championshipPoints: tokenNameOnly[0].championshipPoints,
+        match: {
+          status: "normalized-name",
+          leaderboardDisplayName: tokenNameOnly[0].displayName
+        }
+      };
+    }
+
+    if (tokenNameOnly.length > 1) {
+      return {
+        championshipPoints: null,
+        match: {
+          status: "ambiguous",
+          candidates: tokenNameOnly.map((entry) => entry.displayName)
+        }
+      };
+    }
+  }
+
   return {
     championshipPoints: null,
     match: { status: "not-found" }
   };
+}
+
+function firstLastKey(displayName: string): string {
+  const parts = displayName
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (parts.length < 2) {
+    return parts[0] ?? "";
+  }
+
+  return `${parts[0]}|${parts[parts.length - 1]}`;
 }
