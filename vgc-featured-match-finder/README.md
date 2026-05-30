@@ -57,9 +57,10 @@ Os CP são gravados no banco via script local:
 
 ```bash
 cd vgc-featured-match-finder
-# Defina CP_IMPORT_SECRET em .env.lakebed.server e rode deploy
+cp .env.lakebed.server.example .env.lakebed.server   # edite CP_IMPORT_SECRET
 npx lakebed deploy
-node scripts/sync-cp-to-lakebed.mjs --division masters
+npm run sync-cp
+# ou: ./scripts/sync-cp --division masters
 ```
 
 O app hosted só lê `cpChunks` do banco e importa pairings do torneio.
