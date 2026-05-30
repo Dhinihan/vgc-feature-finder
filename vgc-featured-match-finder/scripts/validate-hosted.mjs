@@ -42,13 +42,25 @@ async function main() {
     const eventText = await page.locator("body").innerText();
     report.hasIndianapolis = /Indianapolis|0000187/i.test(eventText);
 
-    const refreshBtn = page.getByRole("button", { name: /^Atualizar$/i });
+    const refreshBtn = page.getByRole("button", { name: /Atualizar partidas/i });
     if (await refreshBtn.isEnabled()) {
       await refreshBtn.click();
       report.steps.push("clicked refresh");
-      await page.waitForTimeout(20_000);
+
+      const updatingBtn = page.getByRole("button", { name: /Atualizando/i });
+      const loadingStatus = page.getByText(/Buscando partidas no PokéData/i);
+      const sawLoading =
+        (await updatingBtn.isVisible({ timeout: 5_000 }).catch(() => false)) ||
+        (await loadingStatus.isVisible({ timeout: 5_000 }).catch(() => false));
+      report.sawRefreshLoadingIndicator = sawLoading;
+      if (!sawLoading) {
+        report.errors.push("no loading indicator after clicking Atualizar partidas");
+      }
+
+      await refreshBtn.waitFor({ state: "enabled", timeout: 120_000 }).catch(() => {});
+      await page.waitForTimeout(2_000);
     } else {
-      report.steps.push("skipped refresh (configure imports pairings)");
+      report.steps.push("skipped refresh (button disabled)");
     }
 
     await page.screenshot({ path: join(ARTIFACTS, "03-after-refresh.png"), fullPage: true });
