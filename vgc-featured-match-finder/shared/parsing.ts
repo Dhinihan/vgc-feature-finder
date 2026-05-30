@@ -1,0 +1,364 @@
+import type { ChampionshipPointsPlayer, ParsedTournamentRound } from "./domain";
+import { normalizePlayerName } from "./normalize-player-name";
+
+export type ParsedPlayerLabel = {
+  displayName: string;
+  country: string;
+};
+
+export function parsePlayerLabel(raw: string): ParsedPlayerLabel {
+  const trimmed = raw.trim();
+  const bracketMatch = trimmed.match(/^(.+?)\s*\[([A-Za-z]{2,3})\]\s*$/);
+
+  if (bracketMatch) {
+    return {
+      displayName: bracketMatch[1].trim(),
+      country: bracketMatch[2].toUpperCase()
+    };
+  }
+
+  return {
+    displayName: trimmed,
+    country: ""
+  };
+}
+
+function parsePositiveInt(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.max(0, Math.floor(value));
+  }
+
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number.parseInt(value.replace(/[^\d]/g, ""), 10);
+    if (!Number.isNaN(parsed)) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
+function isPendingResult(result: string | null | undefined): boolean {
+  if (!result) {
+    return true;
+  }
+
+  const normalized = result.trim().toUpperCase();
+  return normalized === "" || normalized === "-" || normalized === "?" || normalized === "PENDING";
+}
+
+export function parseChampionshipPointsPayload(payload: string): ChampionshipPointsPlayer[] {
+  const trimmed = payload.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+    return parseChampionshipPointsJson(trimmed);
+  }
+
+  return parseChampionshipPointsHtml(trimmed);
+}
+
+function parseChampionshipPointsJson(payload: string): ChampionshipPointsPlayer[] {
+  const parsed = JSON.parse(payload) as unknown;
+  const rows = Array.isArray(parsed)
+    ? parsed
+    : typeof parsed === "object" && parsed !== null && Array.isArray((parsed as { players?: unknown }).players)
+      ? (parsed as { players: unknown[] }).players
+      : [];
+
+  const players: ChampionshipPointsPlayer[] = [];
+
+  for (const row of rows) {
+    if (typeof row !== "object" || row === null) {
+      continue;
+    }
+
+    const record = row as Record<string, unknown>;
+    const displayName = String(
+      record.displayName ?? record.name ?? record.trainer ?? record.player ?? ""
+    ).trim();
+
+    if (!displayName) {
+      continue;
+    }
+
+    const country = String(record.country ?? record.region ?? "").trim().toUpperCase();
+    const points =
+      parsePositiveInt(record.championshipPoints) ??
+      parsePositiveInt(record.points) ??
+      parsePositiveInt(record.cp) ??
+      parsePositiveInt(record.total);
+
+    if (points === null) {
+      continue;
+    }
+
+    players.push({
+      displayName,
+      normalizedName: normalizePlayerName(displayName),
+      country,
+      championshipPoints: points
+    });
+  }
+
+  return dedupeChampionshipPoints(players);
+}
+
+function parseChampionshipPointsHtml(payload: string): ChampionshipPointsPlayer[] {
+  const players: ChampionshipPointsPlayer[] = [];
+
+  const rowPattern =
+    /<tr[^>]*>[\s\S]*?<\/tr>/gi;
+  const rows = payload.match(rowPattern) ?? [];
+
+  for (const row of rows) {
+    const nameMatch = row.match(/>([^<]{2,80})<\/td>/i);
+    const cpMatch =
+      row.match(/class="pp"[^>]*>\s*([\d,]+)/i) ??
+      row.match(/class="cp"[^>]*>[\s\S]*?([\d,]+)/i);
+
+    if (!nameMatch || !cpMatch) {
+      continue;
+    }
+
+    const label = parsePlayerLabel(nameMatch[1].replace(/&amp;/g, "&").trim());
+    const points = parsePositiveInt(cpMatch[1]);
+
+    if (!label.displayName || points === null) {
+      continue;
+    }
+
+    players.push({
+      displayName: label.displayName,
+      normalizedName: normalizePlayerName(label.displayName),
+      country: label.country,
+      championshipPoints: points
+    });
+  }
+
+  const onclickMatches = payload.matchAll(/player\(\s*'([^']+)'\s*,\s*'([^']*)'/g);
+
+  for (const match of onclickMatches) {
+    const label = parsePlayerLabel(match[1]);
+    const country = match[2].trim().toUpperCase() || label.country;
+    const index = match.index ?? 0;
+    const nearby = payload.slice(index, index + 400);
+    const cpMatch = nearby.match(/class="pp"[^>]*>\s*([\d,]+)/i);
+
+    if (cpMatch) {
+      const points = parsePositiveInt(cpMatch[1]);
+      if (points !== null) {
+        players.push({
+          displayName: label.displayName,
+          normalizedName: normalizePlayerName(label.displayName),
+          country,
+          championshipPoints: points
+        });
+      }
+    }
+  }
+
+  return dedupeChampionshipPoints(players);
+}
+
+function dedupeChampionshipPoints(players: ChampionshipPointsPlayer[]): ChampionshipPointsPlayer[] {
+  const map = new Map<string, ChampionshipPointsPlayer>();
+
+  for (const player of players) {
+    const key = `${player.normalizedName}|${player.country || "*"}`;
+    const existing = map.get(key);
+
+    if (!existing || player.championshipPoints > existing.championshipPoints) {
+      map.set(key, player);
+    }
+  }
+
+  return [...map.values()].sort((a, b) => b.championshipPoints - a.championshipPoints);
+}
+
+export function parsePairingsPayload(payload: string): ParsedTournamentRound {
+  const trimmed = payload.trim();
+
+  if (!trimmed.startsWith("[")) {
+    throw new Error("pairings payload must be JSON standings array");
+  }
+
+  const standings = JSON.parse(trimmed) as Array<Record<string, unknown>>;
+  const currentRound = detectCurrentRound(standings);
+  const pairings = extractPairingsFromStandings(standings, currentRound);
+
+  return {
+    title: "",
+    currentRound,
+    pairings
+  };
+}
+
+export function parseEventTitleFromHtml(html: string): string {
+  const match = html.match(/<h1[^>]*>([^<]+)</i);
+  if (!match) {
+    return "";
+  }
+
+  return match[1]
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function parseCurrentRoundFromHtml(html: string): number | null {
+  const match = html.match(/Round\s+(\d+)\s*\/\s*(\d+)/i);
+  if (!match) {
+    return null;
+  }
+
+  return Number.parseInt(match[1], 10);
+}
+
+function detectCurrentRound(standings: Array<Record<string, unknown>>): number {
+  let maxRound = 0;
+
+  for (const player of standings) {
+    const rounds = player.rounds;
+    if (!rounds || typeof rounds !== "object") {
+      continue;
+    }
+
+    for (const key of Object.keys(rounds as Record<string, unknown>)) {
+      const roundNumber = Number.parseInt(key, 10);
+      if (!Number.isNaN(roundNumber) && roundNumber > maxRound) {
+        maxRound = roundNumber;
+      }
+    }
+  }
+
+  return maxRound;
+}
+
+function extractPairingsFromStandings(
+  standings: Array<Record<string, unknown>>,
+  roundNumber: number
+): ParsedTournamentRound["pairings"] {
+  const roundKey = String(roundNumber);
+  const seen = new Set<string>();
+  const pairings: ParsedTournamentRound["pairings"] = [];
+
+  for (const playerRow of standings) {
+    const playerName = String(playerRow.name ?? "");
+    const playerLabel = parsePlayerLabel(playerName);
+    const rounds = playerRow.rounds as Record<string, { name?: string; result?: string; table?: number }> | undefined;
+    const round = rounds?.[roundKey];
+
+    if (!round) {
+      continue;
+    }
+
+    const opponentRaw = String(round.name ?? "").trim();
+    const isBye = opponentRaw.toUpperCase() === "BYE" || opponentRaw === "";
+    const tableNumber = typeof round.table === "number" && round.table > 0 ? round.table : null;
+    const playerSide = normalizePlayerName(playerLabel.displayName);
+
+    if (isBye) {
+      const byeKey = `bye:${playerSide}:${roundKey}`;
+      if (seen.has(byeKey)) {
+        continue;
+      }
+      seen.add(byeKey);
+
+      pairings.push({
+        tableNumber,
+        playerA: playerLabel,
+        playerB: null,
+        result: round.result ?? "W",
+        isPending: isPendingResult(round.result),
+        isBye: true
+      });
+      continue;
+    }
+
+    const opponentLabel = parsePlayerLabel(opponentRaw);
+    const opponentSide = normalizePlayerName(opponentLabel.displayName);
+    const names = [playerSide, opponentSide].sort();
+    const dedupeKey = `${tableNumber ?? 0}:${names[0]}:${names[1]}`;
+
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+
+    if (playerSide > opponentSide) {
+      continue;
+    }
+
+    seen.add(dedupeKey);
+
+    pairings.push({
+      tableNumber,
+      playerA: playerLabel,
+      playerB: opponentLabel,
+      result: formatMatchResult(round.result),
+      isPending: isPendingResult(round.result),
+      isBye: false
+    });
+  }
+
+  return pairings.sort((a, b) => (a.tableNumber ?? 99999) - (b.tableNumber ?? 99999));
+}
+
+function formatMatchResult(result: string | undefined): string | null {
+  if (!result) {
+    return null;
+  }
+
+  const normalized = result.trim().toUpperCase();
+  if (isPendingResult(normalized)) {
+    return null;
+  }
+
+  return normalized;
+}
+
+export function extractExternalEventId(input: string): string {
+  const trimmed = input.trim();
+
+  if (!trimmed) {
+    return "";
+  }
+
+  const urlMatch = trimmed.match(/standingsVGC\/(\d+)/i);
+  if (urlMatch) {
+    return urlMatch[1];
+  }
+
+  if (/^\d+$/.test(trimmed)) {
+    return trimmed;
+  }
+
+  return trimmed;
+}
+
+export function divisionJsonFileName(division: string): string {
+  const normalized = division.trim().toLowerCase();
+  if (normalized === "juniors") {
+    return "Juniors";
+  }
+  if (normalized === "seniors") {
+    return "Seniors";
+  }
+  return "Masters";
+}
+
+/** Minimal fixture used when external CP sources return no rows (local/demo). */
+export const DEMO_CHAMPIONSHIP_POINTS_JSON = JSON.stringify([
+  { name: "Dylan Salvanera", country: "US", points: 1200 },
+  { name: "Zachary Weed", country: "US", points: 950 },
+  { name: "Raghav Malaviya", country: "US", points: 800 },
+  { name: "Zachary Carlson", country: "US", points: 725 },
+  { name: "James Evans", country: "US", points: 700 },
+  { name: "Oliver Eskolin", country: "FI", points: 650 },
+  { name: "Andrew Figueras", country: "US", points: 600 },
+  { name: "Emily Parson", country: "US", points: 550 },
+  { name: "Henry Rich", country: "AU", points: 500 },
+  { name: "Justin Tang", country: "US", points: 450 }
+]);
