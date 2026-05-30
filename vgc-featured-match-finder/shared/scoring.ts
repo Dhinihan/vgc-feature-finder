@@ -1,5 +1,10 @@
 import type { Pairing, RankedPairing } from "./domain";
 
+/** CP ausente no ranking conta como 1 na relevância (cpA × cpB), não 0. */
+function cpForScoring(cp: number | null): number {
+  return cp ?? 1;
+}
+
 export function scorePairing(pairing: Pairing): RankedPairing {
   if (!pairing.playerB || pairing.isBye) {
     return {
@@ -14,7 +19,7 @@ export function scorePairing(pairing: Pairing): RankedPairing {
 
   return {
     ...pairing,
-    importanceScore: (cpA ?? 0) * (cpB ?? 0),
+    importanceScore: cpForScoring(cpA) * cpForScoring(cpB),
     scoreStatus: cpA === null || cpB === null ? "missing-player-cp" : "complete"
   };
 }

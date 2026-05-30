@@ -1,6 +1,10 @@
 import { matchPlayerToChampionshipPoints } from "./match-player";
 import { normalizePlayerName } from "./normalize-player-name";
-import { parseChampionshipPointsPayload, parsePairingsPayload } from "./parsing";
+import {
+  formatTournamentRecord,
+  parseChampionshipPointsPayload,
+  parsePairingsPayload
+} from "./parsing";
 import { rankPairings, scorePairing } from "./scoring";
 import type { ChampionshipPointsPlayer, Pairing, PlayerOverride } from "./domain";
 
@@ -69,6 +73,7 @@ export function runSmokeTests(): string[] {
       displayName: "A",
       normalizedName: "a",
       country: "US",
+      tournamentRecord: null,
       championshipPoints: 800,
       championshipPointsMatch: { status: "exact", leaderboardDisplayName: "A" }
     },
@@ -76,6 +81,7 @@ export function runSmokeTests(): string[] {
       displayName: "B",
       normalizedName: "b",
       country: "US",
+      tournamentRecord: null,
       championshipPoints: null,
       championshipPointsMatch: { status: "not-found" }
     },
@@ -85,7 +91,7 @@ export function runSmokeTests(): string[] {
   };
 
   const scored = scorePairing(pairing);
-  assert(scored.importanceScore === 0, "missing cp score");
+  assert(scored.importanceScore === 800, "missing cp counts as 1 for scoring");
   assert(scored.scoreStatus === "missing-player-cp", "missing cp status");
 
   const completePairing: Pairing = {
@@ -118,15 +124,21 @@ export function runSmokeTests(): string[] {
   const cpPlayers = parseChampionshipPointsPayload(cpPayload);
   assert(cpPlayers.length === 1, "cp json parser");
 
+  assert(formatTournamentRecord({ wins: 4, losses: 0, ties: 0 }) === "4-0", "record 4-0");
+  assert(formatTournamentRecord({ wins: 2, losses: 2, ties: 0 }) === "2-2", "record 2-2");
+  assert(formatTournamentRecord({ wins: 2, losses: 1, ties: 1 }) === "2-1-1", "record with ties");
+
   const pairingsPayload = JSON.stringify([
     {
       name: "Alice [US]",
+      record: { wins: 1, losses: 0, ties: 0 },
       rounds: {
         "1": { name: "Bob [US]", result: "W", table: 3 }
       }
     },
     {
       name: "Bob [US]",
+      record: { wins: 0, losses: 1, ties: 0 },
       rounds: {
         "1": { name: "Alice [US]", result: "L", table: 3 }
       }
@@ -135,6 +147,10 @@ export function runSmokeTests(): string[] {
 
   const parsedRound = parsePairingsPayload(pairingsPayload);
   assert(parsedRound.pairings.length === 1, "pairings dedupe");
+  assert(parsedRound.pairings[0].result === "W", "pairings keep W/L result");
+  assert(parsedRound.pairings[0].isPending === false, "finished match not pending");
+  assert(parsedRound.pairings[0].playerA.tournamentRecord === "1-0", "player A tournament record");
+  assert(parsedRound.pairings[0].playerB?.tournamentRecord === "0-1", "player B tournament record");
 
 
   const cpHtml = `<tr><td>1</td><td><div class="player">Dylan Matthews</div></td><td><div class="country">USA</div></td><td class="point"><div class="cp">1332</div><div class="pp">30</div></td></tr>`;

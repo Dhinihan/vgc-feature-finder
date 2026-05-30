@@ -30,6 +30,7 @@ export type TournamentPlayer = {
   displayName: string;
   normalizedName: string;
   country: string;
+  tournamentRecord: string | null;
   championshipPoints: number | null;
   championshipPointsMatch: ChampionshipPointsMatch;
 };
@@ -56,8 +57,8 @@ export type ParsedTournamentRound = {
   currentRound: number;
   pairings: Array<{
     tableNumber: number | null;
-    playerA: { displayName: string; country: string };
-    playerB: { displayName: string; country: string } | null;
+    playerA: { displayName: string; country: string; tournamentRecord: string | null };
+    playerB: { displayName: string; country: string; tournamentRecord: string | null } | null;
     result: string | null;
     isPending: boolean;
     isBye: boolean;

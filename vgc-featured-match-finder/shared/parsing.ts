@@ -228,6 +228,59 @@ export function parseCurrentRoundFromHtml(html: string): number | null {
   return Number.parseInt(match[1], 10);
 }
 
+export function formatTournamentRecord(record: unknown): string | null {
+  if (!record || typeof record !== "object") {
+    return null;
+  }
+
+  const row = record as { wins?: unknown; losses?: unknown; ties?: unknown };
+  const wins = parsePositiveInt(row.wins) ?? 0;
+  const losses = parsePositiveInt(row.losses) ?? 0;
+  const ties = parsePositiveInt(row.ties) ?? 0;
+
+  if (wins === 0 && losses === 0 && ties === 0) {
+    return null;
+  }
+
+  if (ties > 0) {
+    return `${wins}-${losses}-${ties}`;
+  }
+
+  return `${wins}-${losses}`;
+}
+
+function tournamentRecordKey(displayName: string, country: string): string {
+  const label = parsePlayerLabel(
+    displayName.includes("[") ? displayName : `${displayName}${country ? ` [${country}]` : ""}`
+  );
+  return `${normalizePlayerName(label.displayName)}:${(label.country || country || "*").toUpperCase()}`;
+}
+
+function buildTournamentRecordIndex(standings: Array<Record<string, unknown>>): Map<string, string> {
+  const index = new Map<string, string>();
+
+  for (const playerRow of standings) {
+    const playerName = String(playerRow.name ?? "");
+    const playerLabel = parsePlayerLabel(playerName);
+    const formatted = formatTournamentRecord(playerRow.record);
+
+    if (!formatted) {
+      continue;
+    }
+
+    index.set(tournamentRecordKey(playerLabel.displayName, playerLabel.country), formatted);
+  }
+
+  return index;
+}
+
+function lookupTournamentRecord(
+  index: Map<string, string>,
+  label: ParsedPlayerLabel
+): string | null {
+  return index.get(tournamentRecordKey(label.displayName, label.country)) ?? null;
+}
+
 function detectCurrentRound(standings: Array<Record<string, unknown>>): number {
   let maxRound = 0;
 
@@ -255,6 +308,7 @@ function extractPairingsFromStandings(
   const roundKey = String(roundNumber);
   const seen = new Set<string>();
   const pairings: ParsedTournamentRound["pairings"] = [];
+  const recordIndex = buildTournamentRecordIndex(standings);
 
   for (const playerRow of standings) {
     const playerName = String(playerRow.name ?? "");
@@ -280,7 +334,12 @@ function extractPairingsFromStandings(
 
       pairings.push({
         tableNumber,
-        playerA: playerLabel,
+        playerA: {
+          ...playerLabel,
+          tournamentRecord:
+            lookupTournamentRecord(recordIndex, playerLabel) ??
+            formatTournamentRecord(playerRow.record)
+        },
         playerB: null,
         result: round.result ?? "W",
         isPending: isPendingResult(round.result),
@@ -306,8 +365,14 @@ function extractPairingsFromStandings(
 
     pairings.push({
       tableNumber,
-      playerA: playerLabel,
-      playerB: opponentLabel,
+      playerA: {
+        ...playerLabel,
+        tournamentRecord: lookupTournamentRecord(recordIndex, playerLabel)
+      },
+      playerB: {
+        ...opponentLabel,
+        tournamentRecord: lookupTournamentRecord(recordIndex, opponentLabel)
+      },
       result: formatMatchResult(round.result),
       isPending: isPendingResult(round.result),
       isBye: false

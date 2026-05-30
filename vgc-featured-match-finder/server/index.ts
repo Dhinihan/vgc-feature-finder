@@ -20,7 +20,9 @@ import type {
   TournamentPlayer
 } from "../shared/domain";
 import { expandCpPlayers, type CompactCpRow } from "../shared/cp-storage";
-import { matchPlayerToChampionshipPoints } from "../shared/match-player";
+import { createLeaderboardIndex, matchPlayerWithLeaderboardIndex } from "../shared/leaderboard-index";
+import type { LeaderboardIndex } from "../shared/leaderboard-index";
+import { readStoredBoolean } from "../shared/stored-boolean";
 import { normalizePlayerName } from "../shared/normalize-player-name";
 import {
   divisionJsonFileName,
@@ -183,6 +185,21 @@ function clearCpStorage(ctx: ServerContext): void {
   deleteAllRows(ctx, "championshipPointsPlayers", ctx.db.championshipPointsPlayers.all());
 }
 
+function sumCpChunkPlayerCounts(ctx: ServerContext): number {
+  let total = 0;
+  for (const row of ctx.db.cpChunks.all()) {
+    try {
+      const parsed = JSON.parse(String(row.body)) as unknown[];
+      if (Array.isArray(parsed)) {
+        total += parsed.length;
+      }
+    } catch {
+      // ignore malformed chunk
+    }
+  }
+  return total;
+}
+
 function readChampionshipPointsMeta(ctx: ServerContext): ChampionshipPointsMeta {
   const metaRow = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.championshipPoints, "");
   let meta: Record<string, unknown> = {};
@@ -199,9 +216,11 @@ function readChampionshipPointsMeta(ctx: ServerContext): ChampionshipPointsMeta 
   const playerCount =
     typeof meta.playerCount === "number"
       ? meta.playerCount
-      : chunkCount > 0
-        ? loadChampionshipPoints(ctx).length
-        : legacyCount;
+      : legacyCount > 0
+        ? legacyCount
+        : chunkCount > 0
+          ? sumCpChunkPlayerCounts(ctx)
+          : 0;
 
   return {
     playerCount,
@@ -279,26 +298,33 @@ function importCpChunk(
 function buildTournamentPlayer(
   displayName: string,
   country: string,
-  leaderboard: ChampionshipPointsPlayer[],
+  tournamentRecord: string | null,
+  leaderboardIndex: LeaderboardIndex,
   overrides: PlayerOverride[]
 ): TournamentPlayer {
   const label = parsePlayerLabel(
     displayName.includes("[") ? displayName : `${displayName}${country ? ` [${country}]` : ""}`
   );
   const resolvedCountry = country || label.country;
-  const matched = matchPlayerToChampionshipPoints(label.displayName, resolvedCountry, leaderboard, overrides);
+  const matched = matchPlayerWithLeaderboardIndex(
+    label.displayName,
+    resolvedCountry,
+    leaderboardIndex,
+    overrides
+  );
 
   return {
     displayName: label.displayName,
     normalizedName: normalizePlayerName(label.displayName),
     country: resolvedCountry,
+    tournamentRecord,
     championshipPoints: matched.championshipPoints,
     championshipPointsMatch: matched.match
   };
 }
 
 function buildPairings(ctx: ServerContext, event: TableRow): Pairing[] {
-  const leaderboard = loadChampionshipPoints(ctx);
+  const leaderboardIndex = createLeaderboardIndex(loadChampionshipPoints(ctx));
   const overrides = loadOverrides(ctx);
   const roundNumber = Number.parseInt(String(event.currentRound), 10) || 0;
 
@@ -307,13 +333,18 @@ function buildPairings(ctx: ServerContext, event: TableRow): Pairing[] {
     .all()
     .filter((row) => Number.parseInt(String(row.roundNumber), 10) === roundNumber)
     .map((row) => {
+      const playerARecord = String(row.playerARecord ?? "").trim() || null;
       const playerA = buildTournamentPlayer(
         String(row.playerAName),
         String(row.playerACountry),
-        leaderboard,
+        playerARecord,
+        leaderboardIndex,
         overrides
       );
       const playerBName = String(row.playerBName);
+      const rawResult = String(row.result ?? "").trim().toUpperCase();
+      const hasResult = rawResult !== "" && rawResult !== "-" && rawResult !== "?";
+      const result = hasResult ? rawResult : null;
 
       return {
         id: row.id,
@@ -322,11 +353,17 @@ function buildPairings(ctx: ServerContext, event: TableRow): Pairing[] {
         tableNumber: String(row.tableNumber) ? Number.parseInt(String(row.tableNumber), 10) : null,
         playerA,
         playerB: playerBName
-          ? buildTournamentPlayer(playerBName, String(row.playerBCountry), leaderboard, overrides)
+          ? buildTournamentPlayer(
+              playerBName,
+              String(row.playerBCountry),
+              String(row.playerBRecord ?? "").trim() || null,
+              leaderboardIndex,
+              overrides
+            )
           : null,
-        result: String(row.result) || null,
-        isPending: Boolean(row.isPending),
-        isBye: Boolean(row.isBye)
+        result,
+        isPending: hasResult ? false : readStoredBoolean(row.isPending, true),
+        isBye: readStoredBoolean(row.isBye, false)
       } satisfies Pairing;
     });
 }
@@ -459,6 +496,20 @@ function isPayloadCacheFresh(row: TableRow | null, ttlMs: number): boolean {
   return Date.now() - fetchedAt < ttlMs;
 }
 
+function pairingsImportFresh(ctx: ServerContext, eventId: string): boolean {
+  const rows = ctx.db.pairings.where("eventId", eventId).all();
+  if (rows.length === 0) {
+    return false;
+  }
+
+  const importedAt = Date.parse(String(rows[0].importedAt));
+  if (Number.isNaN(importedAt)) {
+    return false;
+  }
+
+  return Date.now() - importedAt < PAIRINGS_CACHE_MS;
+}
+
 function cpImportSecretMatches(ctx: ServerContext, provided: string | null): boolean {
   const expected = ctx.env.CP_IMPORT_SECRET?.trim();
   if (!expected) {
@@ -473,8 +524,8 @@ function insertPairingRow(
   currentRound: number,
   pairing: {
     tableNumber: number | null;
-    playerA: { displayName: string; country: string };
-    playerB: { displayName: string; country: string } | null;
+    playerA: { displayName: string; country: string; tournamentRecord: string | null };
+    playerB: { displayName: string; country: string; tournamentRecord: string | null } | null;
     result: string | null;
     isPending: boolean;
     isBye: boolean;
@@ -491,9 +542,11 @@ function insertPairingRow(
     playerAName: playerALabel.displayName,
     playerANormalizedName: normalizePlayerName(playerALabel.displayName),
     playerACountry: playerALabel.country,
+    playerARecord: playerALabel.tournamentRecord ?? "",
     playerBName: playerBLabel ? playerBLabel.displayName : "",
     playerBNormalizedName: playerBLabel ? normalizePlayerName(playerBLabel.displayName) : "",
     playerBCountry: playerBLabel ? playerBLabel.country : "",
+    playerBRecord: playerBLabel ? playerBLabel.tournamentRecord ?? "" : "",
     result: pairing.result ?? "",
     isPending: pairing.isPending,
     isBye: pairing.isBye,
@@ -564,7 +617,7 @@ function applyPairingsPayload(
 async function importPairingsForEvent(
   ctx: ServerContext,
   event: TableRow,
-  options?: { force?: boolean }
+  options?: { force?: boolean; fetchPageHtml?: boolean }
 ): Promise<{
   roundNumber: number;
   pairingCount: number;
@@ -576,32 +629,34 @@ async function importPairingsForEvent(
   const externalEventId = String(event.externalEventId);
   const division = String(event.division) || "masters";
 
-  const pageUrl = standingsPageUrl(externalEventId, division);
-  const pageHtml = await fetchText(pageUrl);
-  const htmlRound = parseCurrentRoundFromHtml(pageHtml);
-
   const jsonUrl = standingsJsonUrl(externalEventId, division);
   let jsonBody = "";
   let fromCache = false;
   const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id);
+  const standingsRound = cached ? parsePairingsPayload(String(cached.body)).currentRound : null;
 
   if (
     !options?.force &&
-    pairingsCacheFresh(ctx, event.id) &&
+    pairingsImportFresh(ctx, event.id) &&
     cached &&
-    htmlRound !== null &&
-    countPairingsInRound(String(cached.body), htmlRound) > 0
+    standingsRound !== null &&
+    countPairingsInRound(String(cached.body), standingsRound) > 0
   ) {
     jsonBody = String(cached.body);
     fromCache = true;
     ctx.log.info("pairings served from cache", {
       externalEventId,
       fetchedAt: String(cached.fetchedAt),
-      roundNumber: htmlRound
+      roundNumber: standingsRound
     });
   } else {
     jsonBody = await fetchText(jsonUrl);
     replaceSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id, jsonBody);
+  }
+
+  let pageHtml: string | null = null;
+  if (options?.fetchPageHtml) {
+    pageHtml = await fetchText(standingsPageUrl(externalEventId, division));
   }
 
   const result = applyPairingsPayload(ctx, event, jsonBody, pageHtml);
@@ -642,9 +697,11 @@ export default capsule({
       playerAName: string(),
       playerANormalizedName: string(),
       playerACountry: string(),
+      playerARecord: string(),
       playerBName: string(),
       playerBNormalizedName: string(),
       playerBCountry: string(),
+      playerBRecord: string(),
       result: string(),
       isPending: boolean().default(true),
       isBye: boolean().default(false),
@@ -676,7 +733,7 @@ export default capsule({
   },
 
   queries: {
-    eventDashboard: query((ctx) => buildEventDashboard(ctx as ServerContext, { pendingOnly: true })),
+    eventDashboard: query((ctx) => buildEventDashboard(ctx as ServerContext, { pendingOnly: false })),
 
     unmatchedPlayers: query((ctx) => {
       const serverCtx = ctx as ServerContext;
@@ -783,13 +840,17 @@ export default capsule({
           eventId: duplicate.id
         });
 
-        const refreshed = await importPairingsForEvent(serverCtx, {
-          ...duplicate,
-          externalEventId: parsedId,
-          sourceUrl: resolvedSourceUrl,
-          division: normalizedDivision,
-          isActive: true
-        }, { force: true });
+        const refreshed = await importPairingsForEvent(
+          serverCtx,
+          {
+            ...duplicate,
+            externalEventId: parsedId,
+            sourceUrl: resolvedSourceUrl,
+            division: normalizedDivision,
+            isActive: true
+          },
+          { force: true, fetchPageHtml: true }
+        );
 
         return { eventId: duplicate.id, ...refreshed };
       }
@@ -810,7 +871,10 @@ export default capsule({
         eventId: created.id
       });
 
-      const refreshed = await importPairingsForEvent(serverCtx, created, { force: true });
+      const refreshed = await importPairingsForEvent(serverCtx, created, {
+        force: true,
+        fetchPageHtml: true
+      });
 
       return { eventId: created.id, ...refreshed };
     }),
@@ -849,7 +913,10 @@ export default capsule({
       serverCtx.log.info("pairings refresh started", { externalEventId, division });
 
       try {
-        const result = await importPairingsForEvent(serverCtx, event);
+        const result = await importPairingsForEvent(serverCtx, event, {
+          force: true,
+          fetchPageHtml: false
+        });
         const now = new Date().toISOString();
 
         serverCtx.db.refreshRuns.update(run.id, {
@@ -901,7 +968,10 @@ export default capsule({
       const championshipPointsFromCache = championshipPointsCount > 0;
       let pairingsFromCache = false;
 
-      const pairingsResult = await importPairingsForEvent(serverCtx, event);
+      const pairingsResult = await importPairingsForEvent(serverCtx, event, {
+        force: true,
+        fetchPageHtml: false
+      });
       pairingsFromCache = pairingsResult.fromCache;
       const now = new Date().toISOString();
 

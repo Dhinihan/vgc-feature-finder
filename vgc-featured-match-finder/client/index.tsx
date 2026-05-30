@@ -22,7 +22,7 @@ type RefreshRunRow = {
   message: string;
 };
 
-type FilterMode = "pending" | "hide-missing" | "top10" | "top25" | "all";
+type FilterMode = "pending" | "finished" | "hide-missing" | "top10" | "top25" | "all";
 
 const EMPTY_DASHBOARD: EventDashboard = {
   event: null,
@@ -54,17 +54,33 @@ function formatScore(value: number): string {
   return formatNumber(value);
 }
 
-function scoreStatusLabel(status: string): string {
-  if (status === "complete") {
-    return "completo";
+function formatTournamentRecord(record: string | null): string | null {
+  const trimmed = record?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function formatMatchResultLabel(pairing: EventDashboard["rankedPairings"][number]): string {
+  if (pairing.isBye) {
+    return "BYE";
   }
-  if (status === "missing-player-cp") {
-    return "CP ausente";
+
+  const result = pairing.result?.trim().toUpperCase();
+  if (result === "W") {
+    return "Vitória A";
   }
-  if (status === "bye") {
-    return "bye";
+  if (result === "L") {
+    return "Vitória B";
   }
-  return status;
+  if (result === "T") {
+    return "Empate";
+  }
+  if (result) {
+    return result;
+  }
+  if (pairing.isPending) {
+    return "Pendente";
+  }
+  return "Pendente";
 }
 
 function matchStatusLabel(
@@ -105,8 +121,7 @@ export function App() {
 
   const [eventInput, setEventInput] = useState("");
   const [division, setDivision] = useState("masters");
-  const [filterMode, setFilterMode] = useState<FilterMode>("pending");
-  const [showCompleted, setShowCompleted] = useState(false);
+  const [filterMode, setFilterMode] = useState<FilterMode>("all");
   const [statusMessage, setStatusMessage] = useState("");
   const [overrideForm, setOverrideForm] = useState({
     tournamentNormalizedName: "",
@@ -118,10 +133,10 @@ export function App() {
   const filteredPairings = useMemo(() => {
     let rows = dashboard.rankedPairings;
 
-    if (!showCompleted && filterMode === "pending") {
+    if (filterMode === "pending") {
       rows = rows.filter((row) => row.isPending);
-    } else if (showCompleted) {
-      rows = dashboard.rankedPairings;
+    } else if (filterMode === "finished") {
+      rows = rows.filter((row) => !row.isPending && Boolean(row.result));
     }
 
     if (filterMode === "hide-missing") {
@@ -137,7 +152,7 @@ export function App() {
     }
 
     return rows;
-  }, [dashboard.rankedPairings, filterMode, showCompleted]);
+  }, [dashboard.rankedPairings, filterMode]);
 
   async function onConfigureEvent(event: Event) {
     event.preventDefault();
@@ -332,11 +347,12 @@ export function App() {
             <div className="flex flex-wrap gap-2 text-sm">
               {(
                 [
+                  ["all", "Todas"],
+                  ["finished", "Com placar"],
                   ["pending", "Somente pendentes"],
                   ["hide-missing", "Ocultar CP ausente"],
                   ["top10", "Top 10"],
-                  ["top25", "Top 25"],
-                  ["all", "Todas"]
+                  ["top25", "Top 25"]
                 ] as const
               ).map(([mode, label]) => (
                 <button
@@ -347,10 +363,7 @@ export function App() {
                       ? "bg-emerald-500 text-slate-950"
                       : "border border-slate-700 text-slate-300"
                   }`}
-                  onClick={() => {
-                    setFilterMode(mode);
-                    setShowCompleted(mode === "all");
-                  }}
+                  onClick={() => setFilterMode(mode)}
                 >
                   {label}
                 </button>
@@ -363,13 +376,12 @@ export function App() {
               <thead className="border-b border-slate-800 text-slate-400">
                 <tr>
                   <th className="px-3 py-2">Posição</th>
-                  <th className="px-3 py-2">Mesa</th>
                   <th className="px-3 py-2">Jogador A</th>
                   <th className="px-3 py-2">CP A</th>
                   <th className="px-3 py-2">Jogador B</th>
                   <th className="px-3 py-2">CP B</th>
-                  <th className="px-3 py-2">Score</th>
-                  <th className="px-3 py-2">Status</th>
+                  <th className="px-3 py-2">Placar</th>
+                  <th className="px-3 py-2">Relevância</th>
                 </tr>
               </thead>
               <tbody>
@@ -377,10 +389,14 @@ export function App() {
                   <tr key={pairing.id} className="border-b border-slate-900/80">
                     <td className="px-3 py-3">{index + 1}</td>
                     <td className="px-3 py-3">
-                      {pairing.tableNumber ? `Mesa ${pairing.tableNumber}` : "—"}
-                    </td>
-                    <td className="px-3 py-3">
-                      <div>{pairing.playerA.displayName}</div>
+                      <div className="flex flex-wrap items-baseline gap-2">
+                        <span>{pairing.playerA.displayName}</span>
+                        {formatTournamentRecord(pairing.playerA.tournamentRecord) ? (
+                          <span className="rounded bg-slate-800 px-1.5 py-0.5 text-xs font-medium text-slate-200">
+                            {formatTournamentRecord(pairing.playerA.tournamentRecord)}
+                          </span>
+                        ) : null}
+                      </div>
                       <div className="text-xs text-slate-500">
                         {matchStatusLabel(pairing.playerA.championshipPointsMatch)}
                       </div>
@@ -389,7 +405,14 @@ export function App() {
                     <td className="px-3 py-3">
                       {pairing.playerB ? (
                         <>
-                          <div>{pairing.playerB.displayName}</div>
+                          <div className="flex flex-wrap items-baseline gap-2">
+                            <span>{pairing.playerB.displayName}</span>
+                            {formatTournamentRecord(pairing.playerB.tournamentRecord) ? (
+                              <span className="rounded bg-slate-800 px-1.5 py-0.5 text-xs font-medium text-slate-200">
+                                {formatTournamentRecord(pairing.playerB.tournamentRecord)}
+                              </span>
+                            ) : null}
+                          </div>
                           <div className="text-xs text-slate-500">
                             {matchStatusLabel(pairing.playerB.championshipPointsMatch)}
                           </div>
@@ -401,15 +424,15 @@ export function App() {
                     <td className="px-3 py-3">
                       {pairing.playerB ? formatCp(pairing.playerB.championshipPoints) : "—"}
                     </td>
+                    <td className="px-3 py-3 font-medium">{formatMatchResultLabel(pairing)}</td>
                     <td className="px-3 py-3 font-medium text-emerald-300">
                       {formatScore(pairing.importanceScore)}
                     </td>
-                    <td className="px-3 py-3">{scoreStatusLabel(pairing.scoreStatus)}</td>
                   </tr>
                 ))}
                 {filteredPairings.length === 0 ? (
                   <tr>
-                    <td className="px-3 py-6 text-slate-400" colSpan={8}>
+                    <td className="px-3 py-6 text-slate-400" colSpan={7}>
                       {dashboard.stats.totalPairings === 0
                         ? "Nenhuma partida carregada. Configure o evento e clique Atualizar."
                         : "Nenhuma partida neste filtro. Tente o filtro 'Todas' ou desmarque pendentes."}
