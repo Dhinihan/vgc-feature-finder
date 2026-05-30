@@ -1,6 +1,6 @@
 import { useAuth, useMutation, useQuery } from "lakebed/client";
 import { useMemo, useState } from "preact/hooks";
-import type { EventDashboard, RefreshResult } from "../shared/domain";
+import type { ChampionshipPointsMeta, EventDashboard, RefreshResult } from "../shared/domain";
 
 type UnmatchedPlayer = {
   displayName: string;
@@ -96,11 +96,11 @@ export function App() {
   };
   const unmatchedPlayers = useQuery<UnmatchedPlayer[]>("unmatchedPlayers") ?? [];
   const refreshRuns = useQuery<RefreshRunRow[]>("refreshRuns") ?? [];
+  const cpMeta = useQuery<ChampionshipPointsMeta>("championshipPointsMeta");
 
   const configureEvent = useMutation<[string, string, string], { eventId: string }>("configureEvent");
   const refreshAll = useMutation<[], RefreshResult>("refreshAll");
   const refreshPairings = useMutation<[], unknown>("refreshPairings");
-  const refreshChampionshipPoints = useMutation<[], unknown>("refreshChampionshipPoints");
   const savePlayerOverride = useMutation<[string, string, string, string], void>("savePlayerOverride");
 
   const [eventInput, setEventInput] = useState("");
@@ -158,7 +158,7 @@ export function App() {
         result.pairingsFromCache ? "partidas em cache" : "partidas atualizadas"
       ].join(" · ");
       setStatusMessage(
-        `Atualização concluída. Rodada ${result.roundNumber}, ${result.pairingsCount} partidas, ${result.championshipPointsCount} jogadores com CP (${cacheNote}).`
+        `Atualização concluída. Rodada ${result.roundNumber}, ${result.pairingsCount} partidas. CP no banco: ${result.championshipPointsCount}.`
       );
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : "Falha na atualização.");
@@ -295,7 +295,23 @@ export function App() {
           </form>
 
           <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
-            <h2 className="text-lg font-medium">Atualizações parciais</h2>
+            <h2 className="text-lg font-medium">Atualizações</h2>
+            <p className="mt-2 text-sm text-slate-400">
+              Partidas vêm do PokéData no Lakebed. Championship Points são sincronizados fora do
+              app (script local) por limite de runtime do Lakebed.
+            </p>
+            <div className="mt-3 rounded-lg border border-slate-700/80 bg-slate-950/60 px-3 py-2 text-sm text-slate-300">
+              <span className="text-slate-400">CP no banco:</span>{" "}
+              {cpMeta?.playerCount ? formatNumber(cpMeta.playerCount) : "0"} jogadores
+              {cpMeta?.importedAt ? (
+                <span className="text-slate-500">
+                  {" "}
+                  · importado {new Date(cpMeta.importedAt).toLocaleString("pt-BR")}
+                </span>
+              ) : (
+                <span className="text-amber-400/90"> · rode scripts/sync-cp-to-lakebed.mjs</span>
+              )}
+            </div>
             <div className="mt-4 flex flex-wrap gap-2">
               <button
                 type="button"
@@ -304,18 +320,6 @@ export function App() {
                 onClick={() => void refreshPairings().then(() => setStatusMessage("Partidas atualizadas."))}
               >
                 Atualizar partidas
-              </button>
-              <button
-                type="button"
-                className="rounded-lg border border-slate-600 px-3 py-2 text-sm hover:bg-slate-800 disabled:opacity-50"
-                disabled={false}
-                onClick={() =>
-                  void refreshChampionshipPoints().then(() =>
-                    setStatusMessage("Championship Points atualizados.")
-                  )
-                }
-              >
-                Atualizar CPs
               </button>
             </div>
             {statusMessage ? <p className="mt-4 text-sm text-slate-300">{statusMessage}</p> : null}

@@ -101,3 +101,12 @@ export type RefreshResult = {
   championshipPointsFromCache: boolean;
   pairingsFromCache: boolean;
 };
+
+export type ChampionshipPointsMeta = {
+  playerCount: number;
+  chunkCount: number;
+  importedAt: string | null;
+  division: string;
+  source: string;
+};
+

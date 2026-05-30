@@ -1,12 +1,16 @@
 import {
   boolean,
   capsule,
+  endpoint,
+  json,
   mutation,
   query,
   string,
-  table
+  table,
+  text
 } from "lakebed/server";
 import type {
+  ChampionshipPointsMeta,
   ChampionshipPointsPlayer,
   EventDashboard,
   Pairing,
@@ -15,10 +19,10 @@ import type {
   RefreshResult,
   TournamentPlayer
 } from "../shared/domain";
+import { expandCpPlayers, type CompactCpRow } from "../shared/cp-storage";
 import { matchPlayerToChampionshipPoints } from "../shared/match-player";
 import { normalizePlayerName } from "../shared/normalize-player-name";
 import {
-  DEMO_CHAMPIONSHIP_POINTS_JSON,
   divisionJsonFileName,
   extractExternalEventId,
   parseChampionshipPointsPayload,
@@ -151,12 +155,125 @@ function loadOverrides(ctx: ServerContext): PlayerOverride[] {
 }
 
 function loadChampionshipPoints(ctx: ServerContext): ChampionshipPointsPlayer[] {
+  const chunkRows = ctx.db.cpChunks.all().sort(
+    (a, b) => Number.parseInt(String(a.chunkIndex), 10) - Number.parseInt(String(b.chunkIndex), 10)
+  );
+
+  if (chunkRows.length > 0) {
+    const compact: CompactCpRow[] = [];
+    for (const row of chunkRows) {
+      const parsed = JSON.parse(String(row.body)) as CompactCpRow[];
+      if (Array.isArray(parsed)) {
+        compact.push(...parsed);
+      }
+    }
+    return expandCpPlayers(compact);
+  }
+
   return ctx.db.championshipPointsPlayers.all().map((row) => ({
     displayName: String(row.displayName),
     normalizedName: String(row.normalizedName),
     country: String(row.country),
     championshipPoints: Number.parseInt(String(row.championshipPoints), 10) || 0
   }));
+}
+
+function clearCpStorage(ctx: ServerContext): void {
+  deleteAllRows(ctx, "cpChunks", ctx.db.cpChunks.all());
+  deleteAllRows(ctx, "championshipPointsPlayers", ctx.db.championshipPointsPlayers.all());
+}
+
+function readChampionshipPointsMeta(ctx: ServerContext): ChampionshipPointsMeta {
+  const metaRow = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.championshipPoints, "");
+  let meta: Record<string, unknown> = {};
+  if (metaRow) {
+    try {
+      meta = JSON.parse(String(metaRow.body)) as Record<string, unknown>;
+    } catch {
+      meta = {};
+    }
+  }
+
+  const chunkCount = ctx.db.cpChunks.all().length;
+  const legacyCount = ctx.db.championshipPointsPlayers.all().length;
+  const playerCount =
+    typeof meta.playerCount === "number"
+      ? meta.playerCount
+      : chunkCount > 0
+        ? loadChampionshipPoints(ctx).length
+        : legacyCount;
+
+  return {
+    playerCount,
+    chunkCount,
+    importedAt: typeof meta.importedAt === "string" ? meta.importedAt : null,
+    division: typeof meta.division === "string" ? meta.division : "masters",
+    source: typeof meta.source === "string" ? meta.source : "external-sync"
+  };
+}
+
+function importCpChunk(
+  ctx: ServerContext,
+  input: {
+    replace: boolean;
+    chunkIndex: number;
+    chunkTotal: number;
+    division: string;
+    players: CompactCpRow[];
+  }
+): { chunkIndex: number; chunkTotal: number; rowsInChunk: number } {
+  if (input.chunkIndex === 0 && input.replace) {
+    clearCpStorage(ctx);
+  }
+
+  const existing = ctx.db.cpChunks
+    .all()
+    .filter((row) => String(row.chunkIndex) === String(input.chunkIndex));
+
+  deleteAllRows(ctx, "cpChunks", existing);
+
+  ctx.db.cpChunks.insert({
+    chunkIndex: String(input.chunkIndex),
+    body: JSON.stringify(input.players)
+  });
+
+  const importedAt = new Date().toISOString();
+  let playerCount: number | undefined;
+  if (input.chunkIndex === input.chunkTotal - 1) {
+    playerCount = 0;
+    for (const row of ctx.db.cpChunks.all()) {
+      const parsed = JSON.parse(String(row.body)) as CompactCpRow[];
+      if (Array.isArray(parsed)) {
+        playerCount += parsed.length;
+      }
+    }
+  }
+
+  replaceSourcePayload(
+    ctx,
+    PAYLOAD_SOURCE.championshipPoints,
+    "",
+    JSON.stringify({
+      division: input.division,
+      playerCount,
+      chunkTotal: input.chunkTotal,
+      chunksReceived: input.chunkIndex + 1,
+      importedAt,
+      source: "external-sync"
+    })
+  );
+
+  ctx.log.info("cp chunk imported", {
+    chunkIndex: input.chunkIndex,
+    chunkTotal: input.chunkTotal,
+    rowsInChunk: input.players.length
+  });
+
+  return {
+    chunkIndex: input.chunkIndex,
+    chunkTotal: input.chunkTotal,
+    rowsInChunk: input.players.length
+  };
 }
 
 function buildTournamentPlayer(
@@ -342,150 +459,12 @@ function isPayloadCacheFresh(row: TableRow | null, ttlMs: number): boolean {
   return Date.now() - fetchedAt < ttlMs;
 }
 
-function championshipPointsCacheFresh(ctx: ServerContext): boolean {
-  const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.championshipPoints, "");
-  const rowCount = ctx.db.championshipPointsPlayers.all().length;
-  if (rowCount === 0) {
+function cpImportSecretMatches(ctx: ServerContext, provided: string | null): boolean {
+  const expected = ctx.env.CP_IMPORT_SECRET?.trim();
+  if (!expected) {
     return false;
   }
-  // Demo / partial imports should not block a full refresh
-  if (rowCount < 100) {
-    return false;
-  }
-  return isPayloadCacheFresh(cached, CP_CACHE_MS);
-}
-
-function pairingsCacheFresh(ctx: ServerContext, eventId: string): boolean {
-  const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, eventId);
-  if (!cached || !String(cached.body).trim().startsWith("[")) {
-    return false;
-  }
-  return isPayloadCacheFresh(cached, PAIRINGS_CACHE_MS);
-}
-
-async function fetchChampionshipPointsPayload(
-  ctx: ServerContext,
-  divisionLabel: string
-): Promise<string> {
-  const chunks: string[] = [];
-
-  for (const region of SOURCES.championshipPointsRegions) {
-    try {
-      const body = await fetchText(SOURCES.championshipPointsUrl, {
-        method: "POST",
-        headers: { "content-type": "application/x-www-form-urlencoded" },
-        body: `type=VG&region=${encodeURIComponent(region)}&division=${encodeURIComponent(divisionLabel)}`
-      });
-
-      if (body.includes("<tr") || body.includes("player(")) {
-        chunks.push(body);
-      }
-    } catch (error) {
-      ctx.log.warn("championship points region fetch failed", {
-        region,
-        division: divisionLabel,
-        message: error instanceof Error ? error.message : String(error)
-      });
-    }
-  }
-
-  return chunks.join("\n");
-}
-
-function normalizeCountryForStorage(country: string): string {
-  return country || WILDCARD_COUNTRY;
-}
-
-function persistChampionshipPoints(
-  ctx: ServerContext,
-  players: ChampionshipPointsPlayer[],
-  cacheMeta: { division: string }
-): { playerCount: number; sourceUpdatedAt: string } {
-  const existing = ctx.db.championshipPointsPlayers.all();
-  deleteAllRows(ctx, "championshipPointsPlayers", existing);
-
-  const updatedAt = new Date().toISOString();
-
-  for (const player of players) {
-    ctx.db.championshipPointsPlayers.insert({
-      normalizedName: player.normalizedName,
-      displayName: player.displayName,
-      country: normalizeCountryForStorage(player.country),
-      championshipPoints: String(player.championshipPoints),
-      source: "pokedata-2026",
-      sourceUpdatedAt: updatedAt
-    });
-  }
-
-  replaceSourcePayload(
-    ctx,
-    PAYLOAD_SOURCE.championshipPoints,
-    "",
-    JSON.stringify({
-      division: cacheMeta.division,
-      playerCount: players.length,
-      importedAt: updatedAt
-    })
-  );
-
-  return { playerCount: players.length, sourceUpdatedAt: updatedAt };
-}
-
-async function importChampionshipPoints(
-  ctx: ServerContext,
-  options?: { force?: boolean }
-): Promise<{
-  playerCount: number;
-  sourceUpdatedAt: string;
-  fromCache: boolean;
-}> {
-  if (!options?.force && championshipPointsCacheFresh(ctx)) {
-    const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.championshipPoints, "");
-    const rows = ctx.db.championshipPointsPlayers.all();
-    const latest = rows
-      .map((row) => String(row.sourceUpdatedAt))
-      .sort()
-      .at(-1) ?? new Date().toISOString();
-
-    ctx.log.info("championship points served from cache", {
-      fetchedAt: cached ? String(cached.fetchedAt) : latest,
-      playerCount: rows.length
-    });
-
-    return {
-      playerCount: rows.length,
-      sourceUpdatedAt: latest,
-      fromCache: true
-    };
-  }
-
-  const activeEvent = getActiveEvent(ctx);
-  const divisionLabel = championshipPointsDivisionLabel(
-    activeEvent ? String(activeEvent.division) : "masters"
-  );
-
-  const payload = await fetchChampionshipPointsPayload(ctx, divisionLabel);
-  const players = parseChampionshipPointsPayload(payload);
-
-  if (players.length === 0) {
-    const allowDemoFallback = ctx.env.USE_DEMO_CP_FALLBACK !== "false";
-    if (allowDemoFallback) {
-      ctx.log.warn("using demo championship points fixture", { division: divisionLabel });
-      const demoPlayers = parseChampionshipPointsPayload(DEMO_CHAMPIONSHIP_POINTS_JSON);
-      const result = persistChampionshipPoints(ctx, demoPlayers, { division: divisionLabel });
-      return { ...result, fromCache: false };
-    }
-
-    throw new Error("no championship points parsed from source");
-  }
-
-  ctx.log.info("championship points imported", {
-    division: divisionLabel,
-    playerCount: players.length
-  });
-
-  const result = persistChampionshipPoints(ctx, players, { division: divisionLabel });
-  return { ...result, fromCache: false };
+  return provided === expected;
 }
 
 function insertPairingRow(
@@ -644,6 +623,10 @@ export default capsule({
       lastRefreshAt: string(),
       isActive: boolean().default(true)
     }),
+    cpChunks: table({
+      chunkIndex: string(),
+      body: string()
+    }),
     championshipPointsPlayers: table({
       normalizedName: string(),
       displayName: string(),
@@ -749,7 +732,9 @@ export default capsule({
         .orderBy("createdAt", "desc")
         .limit(20)
         .all();
-    })
+    }),
+
+    championshipPointsMeta: query((ctx) => readChampionshipPointsMeta(ctx as ServerContext))
   },
 
   mutations: {
@@ -830,25 +815,11 @@ export default capsule({
       return { eventId: created.id, ...refreshed };
     }),
 
-    refreshChampionshipPoints: mutation(async (ctx) => {
-      const serverCtx = ctx as ServerContext;
-
-      serverCtx.log.info("championship points refresh started", {});
-
-      try {
-        const result = await importChampionshipPoints(serverCtx, { force: true });
-
-        serverCtx.log.info("championship points refresh completed", {
-          playerCount: result.playerCount
-        });
-
-        return result;
-      } catch (error) {
-        serverCtx.log.error("championship points refresh failed", {
-          message: error instanceof Error ? error.message : String(error)
-        });
-        throw error;
-      }
+    refreshChampionshipPoints: mutation((ctx) => {
+      const meta = readChampionshipPointsMeta(ctx as ServerContext);
+      throw new Error(
+        `CP não são importados no Lakebed (limite de runtime). Rode scripts/sync-cp-to-lakebed.mjs localmente. Jogadores no banco: ${meta.playerCount}.`
+      );
     }),
 
     refreshPairings: mutation(async (ctx) => {
@@ -924,30 +895,11 @@ export default capsule({
         throw new Error("no active event");
       }
 
-      let championshipPointsUpdated = false;
-      let championshipPointsCount = serverCtx.db.championshipPointsPlayers.all().length;
-
-      let championshipPointsFromCache = false;
+      const cpMeta = readChampionshipPointsMeta(serverCtx);
+      const championshipPointsCount = cpMeta.playerCount;
+      const championshipPointsUpdated = false;
+      const championshipPointsFromCache = championshipPointsCount > 0;
       let pairingsFromCache = false;
-
-      if (!championshipPointsCacheFresh(serverCtx)) {
-        try {
-          const cpResult = await importChampionshipPoints(serverCtx);
-          championshipPointsUpdated = !cpResult.fromCache;
-          championshipPointsCount = cpResult.playerCount;
-          championshipPointsFromCache = cpResult.fromCache;
-        } catch (error) {
-          serverCtx.log.warn("refreshAll championship points skipped", {
-            message: error instanceof Error ? error.message : String(error)
-          });
-        }
-      } else {
-        championshipPointsFromCache = true;
-        championshipPointsCount = serverCtx.db.championshipPointsPlayers.all().length;
-        serverCtx.log.info("refreshAll championship points from cache", {
-          playerCount: championshipPointsCount
-        });
-      }
 
       const pairingsResult = await importPairingsForEvent(serverCtx, event);
       pairingsFromCache = pairingsResult.fromCache;
@@ -1028,6 +980,59 @@ export default capsule({
           leaderboardNormalizedName: leaderboardName,
           leaderboardCountry: leaderboardCountryValue
         });
+      }
+    )
+  },
+
+  endpoints: {
+    importChampionshipPoints: endpoint(
+      { method: "POST", path: "/api/cp/import" },
+      async (ctx, req) => {
+        const serverCtx = ctx as ServerContext;
+        const secret = req.headers.get("x-cp-import-secret");
+
+        if (!cpImportSecretMatches(serverCtx, secret)) {
+          return text("unauthorized", { status: 401 });
+        }
+
+        let payload: {
+          replace?: boolean;
+          chunkIndex?: number;
+          chunkTotal?: number;
+          division?: string;
+          players?: CompactCpRow[];
+        };
+
+        try {
+          payload = await req.json();
+        } catch {
+          return json({ ok: false, error: "invalid json" }, { status: 400 });
+        }
+
+        const chunkIndex = Number(payload.chunkIndex);
+        const chunkTotal = Number(payload.chunkTotal);
+        const players = payload.players;
+
+        if (
+          !Number.isInteger(chunkIndex) ||
+          chunkIndex < 0 ||
+          !Number.isInteger(chunkTotal) ||
+          chunkTotal < 1 ||
+          chunkIndex >= chunkTotal ||
+          !Array.isArray(players)
+        ) {
+          return json({ ok: false, error: "invalid chunk payload" }, { status: 400 });
+        }
+
+        const result = importCpChunk(serverCtx, {
+          replace: Boolean(payload.replace),
+          chunkIndex,
+          chunkTotal,
+          division: String(payload.division ?? "masters"),
+          players
+        });
+
+        return json({ ok: true, ...result, meta: readChampionshipPointsMeta(serverCtx) });
       }
     )
   }
