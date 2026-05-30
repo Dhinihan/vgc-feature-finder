@@ -24,6 +24,20 @@ type RefreshRunRow = {
 
 type FilterMode = "pending" | "hide-missing" | "top10" | "top25" | "all";
 
+const EMPTY_DASHBOARD: EventDashboard = {
+  event: null,
+  rankedPairings: [],
+  stats: {
+    totalPairings: 0,
+    pendingPairings: 0,
+    completedPairings: 0,
+    unmatchedPlayers: 0,
+    ambiguousPlayers: 0
+  }
+};
+
+
+
 function formatNumber(value: number): string {
   return value.toLocaleString("en-US");
 }
@@ -73,9 +87,15 @@ function matchStatusLabel(
 
 export function App() {
   const auth = useAuth();
-  const dashboard = useQuery<EventDashboard>("eventDashboard");
-  const unmatchedPlayers = useQuery<UnmatchedPlayer[]>("unmatchedPlayers");
-  const refreshRuns = useQuery<RefreshRunRow[]>("refreshRuns");
+  const dashboardRaw = useQuery<EventDashboard>("eventDashboard");
+  const dashboard: EventDashboard = {
+    ...EMPTY_DASHBOARD,
+    ...dashboardRaw,
+    rankedPairings: dashboardRaw?.rankedPairings ?? [],
+    stats: { ...EMPTY_DASHBOARD.stats, ...dashboardRaw?.stats }
+  };
+  const unmatchedPlayers = useQuery<UnmatchedPlayer[]>("unmatchedPlayers") ?? [];
+  const refreshRuns = useQuery<RefreshRunRow[]>("refreshRuns") ?? [];
 
   const configureEvent = useMutation<[string, string, string], { eventId: string }>("configureEvent");
   const refreshAll = useMutation<[], RefreshResult>("refreshAll");
