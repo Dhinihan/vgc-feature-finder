@@ -1,0 +1,5 @@
+.lakebed/
+.env.lakebed.server
+node_modules/
+package-lock.json
+scripts/browser-validate.mjs

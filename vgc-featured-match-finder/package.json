@@ -1,0 +1,13 @@
+{
+  "name": "vgc-featured-match-finder",
+  "version": "1.0.0",
+  "description": "Lakebed capsule that ranks current-round VGC pairings by Championship Points product (`cpA * cpB`).",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "sync-cp": "bash scripts/sync-cp"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
