@@ -130,6 +130,7 @@ export function App() {
   const [division, setDivision] = useState("masters");
   const [filterMode, setFilterMode] = useState<FilterMode>("all");
   const [statusMessage, setStatusMessage] = useState("");
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [overrideForm, setOverrideForm] = useState({
     tournamentNormalizedName: "",
     tournamentCountry: "*",
@@ -172,8 +173,14 @@ export function App() {
   }
 
   async function onRefreshPairings() {
+    if (isRefreshing) {
+      return;
+    }
+
+    setIsRefreshing(true);
+    setStatusMessage("Atualizando partidas no PokéData...");
+
     try {
-      setStatusMessage("Atualizando partidas no PokéData...");
       const result = await refreshPairings();
       const cpCount = cpMeta?.playerCount ?? 0;
       setStatusMessage(
@@ -181,6 +188,8 @@ export function App() {
       );
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : "Falha na atualização.");
+    } finally {
+      setIsRefreshing(false);
     }
   }
 
@@ -251,14 +260,38 @@ export function App() {
                 : "—"}
             </p>
           </div>
-          <div className="flex items-end">
+          <div className="flex flex-col items-stretch justify-end gap-2">
+            {isRefreshing ? (
+              <p
+                className="flex items-center gap-2 text-sm text-emerald-300"
+                role="status"
+                aria-live="polite"
+              >
+                <span
+                  className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-emerald-300 border-t-transparent"
+                  aria-hidden="true"
+                />
+                Buscando partidas no PokéData...
+              </p>
+            ) : null}
             <button
               type="button"
-              className="w-full rounded-lg bg-emerald-500 px-4 py-3 font-medium text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
-              disabled={!dashboard.event}
+              className="flex w-full items-center justify-center gap-2 rounded-lg bg-emerald-500 px-4 py-3 font-medium text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
+              disabled={!dashboard.event || isRefreshing}
+              aria-busy={isRefreshing}
               onClick={() => void onRefreshPairings()}
             >
-              Atualizar partidas
+              {isRefreshing ? (
+                <>
+                  <span
+                    className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-slate-950 border-t-transparent"
+                    aria-hidden="true"
+                  />
+                  Atualizando...
+                </>
+              ) : (
+                "Atualizar partidas"
+              )}
             </button>
           </div>
         </section>
@@ -331,7 +364,23 @@ export function App() {
                 <span className="text-amber-400/90"> · rode scripts/sync-cp-to-lakebed.mjs</span>
               )}
             </div>
-            {statusMessage ? <p className="mt-4 text-sm text-slate-300">{statusMessage}</p> : null}
+            {statusMessage ? (
+              <p
+                className={`mt-4 flex items-center gap-2 text-sm ${
+                  isRefreshing ? "text-emerald-300" : "text-slate-300"
+                }`}
+                role="status"
+                aria-live="polite"
+              >
+                {isRefreshing ? (
+                  <span
+                    className="inline-block h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-emerald-300 border-t-transparent"
+                    aria-hidden="true"
+                  />
+                ) : null}
+                {statusMessage}
+              </p>
+            ) : null}
           </div>
         </section>
 
