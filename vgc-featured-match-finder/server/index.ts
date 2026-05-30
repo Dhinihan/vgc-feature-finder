@@ -16,7 +16,6 @@ import type {
   Pairing,
   PlayerOverride,
   RankedPairing,
-  RefreshResult,
   TournamentPlayer
 } from "../shared/domain";
 import { expandCpPlayers, type CompactCpRow } from "../shared/cp-storage";
@@ -952,56 +951,6 @@ export default capsule({
         serverCtx.log.error("pairings refresh failed", { externalEventId, message });
         throw error;
       }
-    }),
-
-    refreshAll: mutation(async (ctx) => {
-      const serverCtx = ctx as ServerContext;
-      const event = getActiveEvent(serverCtx);
-
-      if (!event) {
-        throw new Error("no active event");
-      }
-
-      const cpMeta = readChampionshipPointsMeta(serverCtx);
-      const championshipPointsCount = cpMeta.playerCount;
-      const championshipPointsUpdated = false;
-      const championshipPointsFromCache = championshipPointsCount > 0;
-      let pairingsFromCache = false;
-
-      const pairingsResult = await importPairingsForEvent(serverCtx, event, {
-        force: true,
-        fetchPageHtml: false
-      });
-      pairingsFromCache = pairingsResult.fromCache;
-      const now = new Date().toISOString();
-
-      serverCtx.db.refreshRuns.insert({
-        eventId: event.id,
-        startedAt: now,
-        finishedAt: now,
-        status: "success",
-        roundNumber: String(pairingsResult.roundNumber),
-        pairingCount: String(pairingsResult.pairingCount),
-        unmatchedPlayerCount: String(pairingsResult.unmatchedPlayerCount),
-        ambiguousPlayerCount: String(pairingsResult.ambiguousPlayerCount),
-        message: "refreshAll"
-      });
-
-      trimRefreshRuns(serverCtx, event.id);
-
-      const result: RefreshResult = {
-        championshipPointsUpdated,
-        championshipPointsCount,
-        pairingsCount: pairingsResult.pairingCount,
-        roundNumber: pairingsResult.roundNumber,
-        unmatchedPlayerCount: pairingsResult.unmatchedPlayerCount,
-        ambiguousPlayerCount: pairingsResult.ambiguousPlayerCount,
-        championshipPointsFromCache,
-        pairingsFromCache
-      };
-
-      serverCtx.log.info("refreshAll completed", result);
-      return result;
     }),
 
     savePlayerOverride: mutation(
