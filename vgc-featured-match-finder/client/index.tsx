@@ -406,7 +406,9 @@ export function App() {
                 {filteredPairings.length === 0 ? (
                   <tr>
                     <td className="px-3 py-6 text-slate-400" colSpan={8}>
-                      Nenhuma partida para os filtros atuais.
+                      {dashboard.stats.totalPairings === 0
+                        ? "Nenhuma partida carregada. Configure o evento e clique Atualizar."
+                        : "Nenhuma partida neste filtro. Tente o filtro 'Todas' ou desmarque pendentes."}
                     </td>
                   </tr>
                 ) : null}

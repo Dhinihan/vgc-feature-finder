@@ -34,7 +34,7 @@ async function main() {
 
     await page.getByPlaceholder(/0000160|standingsVGC/i).fill(EVENT_ID);
     await page.getByRole("button", { name: /Salvar evento/i }).click();
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(45_000);
     report.steps.push("configured event");
 
     await page.screenshot({ path: join(ARTIFACTS, "02-event-configured.png"), fullPage: true });
@@ -42,10 +42,14 @@ async function main() {
     const eventText = await page.locator("body").innerText();
     report.hasIndianapolis = /Indianapolis|0000187/i.test(eventText);
 
-    await page.getByRole("button", { name: /^Atualizar$/i }).click();
-    report.steps.push("clicked refresh");
-
-    await page.waitForTimeout(35_000);
+    const refreshBtn = page.getByRole("button", { name: /^Atualizar$/i });
+    if (await refreshBtn.isEnabled()) {
+      await refreshBtn.click();
+      report.steps.push("clicked refresh");
+      await page.waitForTimeout(20_000);
+    } else {
+      report.steps.push("skipped refresh (configure imports pairings)");
+    }
 
     await page.screenshot({ path: join(ARTIFACTS, "03-after-refresh.png"), fullPage: true });
 

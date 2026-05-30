@@ -39,6 +39,9 @@ function parsePositiveInt(value: unknown): number | null {
 }
 
 function isPendingResult(result: string | null | undefined): boolean {
+  if (result === null || result === undefined) {
+    return true;
+  }
   if (!result) {
     return true;
   }
@@ -178,6 +181,28 @@ function dedupeChampionshipPoints(players: ChampionshipPointsPlayer[]): Champion
   return [...map.values()].sort((a, b) => b.championshipPoints - a.championshipPoints);
 }
 
+
+export function countPairingsInRound(payload: string, roundNumber: number): number {
+  const trimmed = payload.trim();
+  if (!trimmed.startsWith("[")) {
+    return 0;
+  }
+
+  const standings = JSON.parse(trimmed) as Array<Record<string, unknown>>;
+  return extractPairingsFromStandings(standings, roundNumber).length;
+}
+
+export function parsePairingsForRound(payload: string, roundNumber: number): ParsedTournamentRound["pairings"] {
+  const trimmed = payload.trim();
+  if (!trimmed.startsWith("[")) {
+    throw new Error("pairings payload must be JSON standings array");
+  }
+
+  const standings = JSON.parse(trimmed) as Array<Record<string, unknown>>;
+  return extractPairingsFromStandings(standings, roundNumber);
+}
+
+
 export function parsePairingsPayload(payload: string): ParsedTournamentRound {
   const trimmed = payload.trim();
 
@@ -306,8 +331,11 @@ function extractPairingsFromStandings(
   return pairings.sort((a, b) => (a.tableNumber ?? 99999) - (b.tableNumber ?? 99999));
 }
 
-function formatMatchResult(result: string | undefined): string | null {
-  if (!result) {
+function formatMatchResult(result: string | null | undefined): string | null {
+  if (result === null || result === undefined) {
+    return null;
+  }
+  if (typeof result !== "string") {
     return null;
   }
 

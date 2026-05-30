@@ -24,6 +24,8 @@ import {
   parseChampionshipPointsPayload,
   parseCurrentRoundFromHtml,
   parseEventTitleFromHtml,
+  countPairingsInRound,
+  parsePairingsForRound,
   parsePairingsPayload,
   parsePlayerLabel
 } from "../shared/parsing";
@@ -44,6 +46,7 @@ const PAYLOAD_SOURCE = {
 } as const;
 const REFRESH_RUN_LIMIT = 20;
 const WILDCARD_COUNTRY = "*";
+const MAX_PERSISTED_PAYLOAD_BYTES = 60_000;
 
 type ServerContext = {
   auth: { userId: string };
@@ -109,11 +112,21 @@ function replaceSourcePayload(
 
   deleteAllRows(ctx, "sourcePayloads", existing);
 
+  if (body.length > MAX_PERSISTED_PAYLOAD_BYTES) {
+    ctx.log.warn("source payload not stored (too large for lakebed row limit)", {
+      source,
+      eventId,
+      byteLength: body.length,
+      maxBytes: MAX_PERSISTED_PAYLOAD_BYTES
+    });
+    return;
+  }
+
   ctx.db.sourcePayloads.insert({
     source,
     eventId,
     fetchedAt: new Date().toISOString(),
-    body: body.slice(0, 500_000)
+    body
   });
 }
 
@@ -326,6 +339,9 @@ function championshipPointsCacheFresh(ctx: ServerContext): boolean {
 
 function pairingsCacheFresh(ctx: ServerContext, eventId: string): boolean {
   const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, eventId);
+  if (!cached || !String(cached.body).trim().startsWith("[")) {
+    return false;
+  }
   return isPayloadCacheFresh(cached, PAIRINGS_CACHE_MS);
 }
 
@@ -464,6 +480,18 @@ function insertPairingRow(
   });
 }
 
+
+function clearEventPairingData(ctx: ServerContext, eventId: string): void {
+  const existingPairings = ctx.db.pairings.where("eventId", eventId).all();
+  deleteAllRows(ctx, "pairings", existingPairings);
+
+  const payloads = ctx.db.sourcePayloads
+    .where("source", PAYLOAD_SOURCE.pairingsJson)
+    .all()
+    .filter((row) => String(row.eventId) === eventId);
+  deleteAllRows(ctx, "sourcePayloads", payloads);
+}
+
 function applyPairingsPayload(
   ctx: ServerContext,
   event: TableRow,
@@ -476,9 +504,10 @@ function applyPairingsPayload(
   ambiguousPlayerCount: number;
   title: string;
 } {
-  const parsed = parsePairingsPayload(jsonBody);
   const htmlRound = pageHtml ? parseCurrentRoundFromHtml(pageHtml) : null;
-  const currentRound = htmlRound ?? parsed.currentRound;
+  const standingsRound = parsePairingsPayload(jsonBody).currentRound;
+  const currentRound = htmlRound ?? standingsRound;
+  const pairings = parsePairingsForRound(jsonBody, currentRound);
   const title = (pageHtml ? parseEventTitleFromHtml(pageHtml) : "") || String(event.title);
 
   const existingPairings = ctx.db.pairings.where("eventId", event.id).all();
@@ -486,7 +515,7 @@ function applyPairingsPayload(
 
   const importedAt = new Date().toISOString();
 
-  for (const pairing of parsed.pairings) {
+  for (const pairing of pairings) {
     insertPairingRow(ctx, event.id, currentRound, pairing, importedAt);
   }
 
@@ -504,7 +533,7 @@ function applyPairingsPayload(
 
   return {
     roundNumber: currentRound,
-    pairingCount: parsed.pairings.length,
+    pairingCount: pairings.length,
     unmatchedPlayerCount: unmatched,
     ambiguousPlayerCount: ambiguous,
     title
@@ -526,27 +555,38 @@ async function importPairingsForEvent(
   const externalEventId = String(event.externalEventId);
   const division = String(event.division) || "masters";
 
-  if (!options?.force && pairingsCacheFresh(ctx, event.id)) {
-    const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id);
-    if (cached) {
-      ctx.log.info("pairings served from cache", {
-        externalEventId,
-        fetchedAt: String(cached.fetchedAt)
-      });
-
-      const result = applyPairingsPayload(ctx, event, String(cached.body), null);
-      return { ...result, fromCache: true };
-    }
-  }
+  const pageUrl = standingsPageUrl(externalEventId, division);
+  const pageHtml = await fetchText(pageUrl);
+  const htmlRound = parseCurrentRoundFromHtml(pageHtml);
 
   const jsonUrl = standingsJsonUrl(externalEventId, division);
-  const pageUrl = standingsPageUrl(externalEventId, division);
-  const [jsonBody, pageHtml] = await Promise.all([fetchText(jsonUrl), fetchText(pageUrl)]);
+  let jsonBody = "";
+  let fromCache = false;
+  const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id);
 
-  replaceSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id, jsonBody);
+  if (
+    !options?.force &&
+    pairingsCacheFresh(ctx, event.id) &&
+    cached &&
+    htmlRound !== null &&
+    countPairingsInRound(String(cached.body), htmlRound) > 0
+  ) {
+    jsonBody = String(cached.body);
+    fromCache = true;
+    ctx.log.info("pairings served from cache", {
+      externalEventId,
+      fetchedAt: String(cached.fetchedAt),
+      roundNumber: htmlRound
+    });
+  } else {
+    jsonBody = await fetchText(jsonUrl);
+    replaceSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id, jsonBody);
+  }
 
   const result = applyPairingsPayload(ctx, event, jsonBody, pageHtml);
-  return { ...result, fromCache: false };
+  return { ...result, fromCache };
+
+
 }
 
 export default capsule({
@@ -671,7 +711,7 @@ export default capsule({
   },
 
   mutations: {
-    configureEvent: mutation((ctx, externalEventId: string, sourceUrl: string, division: string) => {
+    configureEvent: mutation(async (ctx, externalEventId: string, sourceUrl: string, division: string) => {
       const parsedId = extractExternalEventId(externalEventId);
       const normalizedDivision = division.trim().toLowerCase() || "masters";
 
@@ -704,13 +744,27 @@ export default capsule({
           lastRefreshAt: now
         });
 
+        clearEventPairingData(serverCtx, duplicate.id);
+        serverCtx.db.events.update(duplicate.id, {
+          currentRound: "0",
+          title: `Event ${parsedId}`
+        });
+
         serverCtx.log.info("event configured", {
           externalEventId: parsedId,
           division: normalizedDivision,
           eventId: duplicate.id
         });
 
-        return { eventId: duplicate.id };
+        const refreshed = await importPairingsForEvent(serverCtx, {
+          ...duplicate,
+          externalEventId: parsedId,
+          sourceUrl: resolvedSourceUrl,
+          division: normalizedDivision,
+          isActive: true
+        }, { force: true });
+
+        return { eventId: duplicate.id, ...refreshed };
       }
 
       const created = serverCtx.db.events.insert({
@@ -729,7 +783,9 @@ export default capsule({
         eventId: created.id
       });
 
-      return { eventId: created.id };
+      const refreshed = await importPairingsForEvent(serverCtx, created, { force: true });
+
+      return { eventId: created.id, ...refreshed };
     }),
 
     refreshChampionshipPoints: mutation(async (ctx) => {
