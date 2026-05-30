@@ -95,8 +95,6 @@ export function App() {
     leaderboardCountry: "*"
   });
 
-  const isAdmin = auth.userId === "vinicius";
-
   const filteredPairings = useMemo(() => {
     let rows = dashboard.rankedPairings;
 
@@ -123,11 +121,6 @@ export function App() {
 
   async function onConfigureEvent(event: Event) {
     event.preventDefault();
-    if (!isAdmin) {
-      setStatusMessage("Somente o administrador pode configurar o evento.");
-      return;
-    }
-
     try {
       await configureEvent(eventInput.trim(), "", division);
       setStatusMessage("Evento configurado.");
@@ -137,16 +130,15 @@ export function App() {
   }
 
   async function onRefreshAll() {
-    if (!isAdmin) {
-      setStatusMessage("Somente o administrador pode atualizar.");
-      return;
-    }
-
     try {
       setStatusMessage("Atualizando dados...");
       const result = await refreshAll();
+      const cacheNote = [
+        result.championshipPointsFromCache ? "CP em cache" : "CP atualizados",
+        result.pairingsFromCache ? "partidas em cache" : "partidas atualizadas"
+      ].join(" · ");
       setStatusMessage(
-        `Atualização concluída. Rodada ${result.roundNumber}, ${result.pairingsCount} partidas, ${result.championshipPointsCount} jogadores com CP.`
+        `Atualização concluída. Rodada ${result.roundNumber}, ${result.pairingsCount} partidas, ${result.championshipPointsCount} jogadores com CP (${cacheNote}).`
       );
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : "Falha na atualização.");
@@ -155,10 +147,6 @@ export function App() {
 
   async function onSaveOverride(event: Event) {
     event.preventDefault();
-    if (!isAdmin) {
-      return;
-    }
-
     try {
       await savePlayerOverride(
         overrideForm.tournamentNormalizedName,
@@ -228,7 +216,7 @@ export function App() {
             <button
               type="button"
               className="w-full rounded-lg bg-emerald-500 px-4 py-3 font-medium text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
-              disabled={!isAdmin || !dashboard.event}
+              disabled={!dashboard.event}
               onClick={() => void onRefreshAll()}
             >
               Atualizar
@@ -279,17 +267,11 @@ export function App() {
               <button
                 type="submit"
                 className="rounded-lg border border-slate-600 px-4 py-2 hover:bg-slate-800 disabled:opacity-50"
-                disabled={!isAdmin}
+                disabled={false}
               >
                 Salvar evento
               </button>
             </div>
-            {!isAdmin ? (
-              <p className="mt-3 text-sm text-amber-300">
-                Para testar mutações localmente, abra{" "}
-                <code className="text-emerald-300">/?lakebed_guest=vinicius</code>.
-              </p>
-            ) : null}
           </form>
 
           <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
@@ -298,7 +280,7 @@ export function App() {
               <button
                 type="button"
                 className="rounded-lg border border-slate-600 px-3 py-2 text-sm hover:bg-slate-800 disabled:opacity-50"
-                disabled={!isAdmin}
+                disabled={false}
                 onClick={() => void refreshPairings().then(() => setStatusMessage("Partidas atualizadas."))}
               >
                 Atualizar partidas
@@ -306,7 +288,7 @@ export function App() {
               <button
                 type="button"
                 className="rounded-lg border border-slate-600 px-3 py-2 text-sm hover:bg-slate-800 disabled:opacity-50"
-                disabled={!isAdmin}
+                disabled={false}
                 onClick={() =>
                   void refreshChampionshipPoints().then(() =>
                     setStatusMessage("Championship Points atualizados.")
@@ -500,7 +482,7 @@ export function App() {
               <button
                 type="submit"
                 className="rounded-lg bg-slate-100 px-4 py-2 font-medium text-slate-950 disabled:opacity-50"
-                disabled={!isAdmin}
+                disabled={false}
               >
                 Salvar override
               </button>

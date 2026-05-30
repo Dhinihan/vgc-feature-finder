@@ -98,4 +98,6 @@ export type RefreshResult = {
   roundNumber: number;
   unmatchedPlayerCount: number;
   ambiguousPlayerCount: number;
+  championshipPointsFromCache: boolean;
+  pairingsFromCache: boolean;
 };

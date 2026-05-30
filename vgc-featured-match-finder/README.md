@@ -6,10 +6,9 @@ Lakebed capsule that ranks current-round VGC pairings by Championship Points pro
 
 ```bash
 cd vgc-featured-match-finder
+cp .env.lakebed.server.example .env.lakebed.server  # opcional (demo CP)
 npx lakebed dev
 ```
-
-Local admin user (mutations): open `http://localhost:3000/?lakebed_guest=vinicius`
 
 Inspect state:
 
@@ -19,13 +18,24 @@ npx lakebed db dump --port 3000
 npx lakebed logs --port 3000
 ```
 
-Smoke tests (pure shared logic):
+Smoke tests:
 
 ```bash
 npx tsx shared/smoke-test.ts
 ```
 
-## Deploy with external fetch
+## Cache
+
+Server-side cache via `sourcePayloads` + TTL (no auth required):
+
+| Fonte | TTL |
+|-------|-----|
+| Championship Points | 12 horas |
+| Partidas (JSON PokéData) | 3 minutos |
+
+Mutations repetidas dentro do TTL reutilizam o payload salvo e evitam `fetch()` externo. O Lakebed aplica rate limits no deploy.
+
+## Deploy com fetch externo
 
 ```bash
 npx lakebed deploy
@@ -33,9 +43,9 @@ npx lakebed claim
 npx lakebed deploy
 ```
 
-Set `ADMIN_USER_ID` in `.env.lakebed.server` for production. Remove or disable `USE_DEMO_CP_FALLBACK` when PokéData CP ingestion is available.
+## Fontes
 
-## Data sources
+- Partidas: `standingsVGC/{eventId}/{division}/*.json`
+- CPs: PokéData `/2026/` (todas as regiões)
 
-- Pairings: PokéData standings JSON (`standingsVGC/{eventId}/{division}/`)
-- Championship Points: PokéData 2026 leaderboard POST (all regions), with optional demo fixture fallback for local development
+Exemplo evento recente: **Indianapolis** → `0000187`

@@ -35,7 +35,13 @@ const SOURCES = {
   championshipPointsRegions: ["NA", "EU", "LA", "AP", "SO", "RU"] as const
 };
 
-const CP_STALE_MS = 12 * 60 * 60 * 1000;
+const CP_CACHE_MS = 12 * 60 * 60 * 1000;
+const PAIRINGS_CACHE_MS = 3 * 60 * 1000;
+
+const PAYLOAD_SOURCE = {
+  championshipPoints: "championship-points",
+  pairingsJson: "pairings-json"
+} as const;
 const REFRESH_RUN_LIMIT = 20;
 const WILDCARD_COUNTRY = "*";
 
@@ -66,13 +72,6 @@ type TableApi = {
   update(id: string, patch: Record<string, string | boolean>): void;
   delete(id: string): void;
 };
-
-function assertAdmin(ctx: ServerContext): void {
-  const adminUserId = ctx.env.ADMIN_USER_ID;
-  if (!adminUserId || ctx.auth.userId !== adminUserId) {
-    throw new Error("unauthorized");
-  }
-}
 
 function getActiveEvent(ctx: ServerContext): TableRow | null {
   const events = ctx.db.events.where("isActive", true).all();
@@ -287,22 +286,47 @@ function standingsPageUrl(externalEventId: string, division: string): string {
   return `${SOURCES.pokeDataBaseUrl}/standingsVGC/${externalEventId}/${division.toLowerCase()}/`;
 }
 
-function championshipPointsAreStale(ctx: ServerContext): boolean {
-  const rows = ctx.db.championshipPointsPlayers.all();
+function getLatestSourcePayload(
+  ctx: ServerContext,
+  source: string,
+  eventId: string
+): TableRow | null {
+  const rows = ctx.db.sourcePayloads
+    .where("source", source)
+    .all()
+    .filter((row) => String(row.eventId) === eventId);
+
   if (rows.length === 0) {
-    return true;
+    return null;
   }
 
-  const latest = rows
-    .map((row) => Date.parse(String(row.sourceUpdatedAt)))
-    .filter((value) => !Number.isNaN(value))
-    .sort((a, b) => b - a)[0];
+  return rows.sort(
+    (a, b) => Date.parse(String(b.fetchedAt)) - Date.parse(String(a.fetchedAt))
+  )[0];
+}
 
-  if (!latest) {
-    return true;
+function isPayloadCacheFresh(row: TableRow | null, ttlMs: number): boolean {
+  if (!row) {
+    return false;
   }
 
-  return Date.now() - latest > CP_STALE_MS;
+  const fetchedAt = Date.parse(String(row.fetchedAt));
+  if (Number.isNaN(fetchedAt)) {
+    return false;
+  }
+
+  return Date.now() - fetchedAt < ttlMs;
+}
+
+function championshipPointsCacheFresh(ctx: ServerContext): boolean {
+  const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.championshipPoints, "");
+  const hasRows = ctx.db.championshipPointsPlayers.all().length > 0;
+  return hasRows && isPayloadCacheFresh(cached, CP_CACHE_MS);
+}
+
+function pairingsCacheFresh(ctx: ServerContext, eventId: string): boolean {
+  const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, eventId);
+  return isPayloadCacheFresh(cached, PAIRINGS_CACHE_MS);
 }
 
 async function fetchChampionshipPointsPayload(ctx: ServerContext): Promise<string> {
@@ -360,10 +384,34 @@ function persistChampionshipPoints(
   return { playerCount: players.length, sourceUpdatedAt: updatedAt };
 }
 
-async function importChampionshipPoints(ctx: ServerContext): Promise<{
+async function importChampionshipPoints(
+  ctx: ServerContext,
+  options?: { force?: boolean }
+): Promise<{
   playerCount: number;
   sourceUpdatedAt: string;
+  fromCache: boolean;
 }> {
+  if (!options?.force && championshipPointsCacheFresh(ctx)) {
+    const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.championshipPoints, "");
+    const rows = ctx.db.championshipPointsPlayers.all();
+    const latest = rows
+      .map((row) => String(row.sourceUpdatedAt))
+      .sort()
+      .at(-1) ?? new Date().toISOString();
+
+    ctx.log.info("championship points served from cache", {
+      fetchedAt: cached ? String(cached.fetchedAt) : latest,
+      playerCount: rows.length
+    });
+
+    return {
+      playerCount: rows.length,
+      sourceUpdatedAt: latest,
+      fromCache: true
+    };
+  }
+
   const payload = await fetchChampionshipPointsPayload(ctx);
   const players = parseChampionshipPointsPayload(payload);
 
@@ -371,13 +419,15 @@ async function importChampionshipPoints(ctx: ServerContext): Promise<{
     if (ctx.env.USE_DEMO_CP_FALLBACK === "true") {
       ctx.log.warn("using demo championship points fixture", {});
       const demoPlayers = parseChampionshipPointsPayload(DEMO_CHAMPIONSHIP_POINTS_JSON);
-      return persistChampionshipPoints(ctx, demoPlayers, DEMO_CHAMPIONSHIP_POINTS_JSON);
+      const result = persistChampionshipPoints(ctx, demoPlayers, DEMO_CHAMPIONSHIP_POINTS_JSON);
+      return { ...result, fromCache: false };
     }
 
     throw new Error("no championship points parsed from source");
   }
 
-  return persistChampionshipPoints(ctx, players, payload);
+  const result = persistChampionshipPoints(ctx, players, payload);
+  return { ...result, fromCache: false };
 }
 
 function insertPairingRow(
@@ -414,25 +464,22 @@ function insertPairingRow(
   });
 }
 
-async function importPairingsForEvent(ctx: ServerContext, event: TableRow): Promise<{
+function applyPairingsPayload(
+  ctx: ServerContext,
+  event: TableRow,
+  jsonBody: string,
+  pageHtml: string | null
+): {
   roundNumber: number;
   pairingCount: number;
   unmatchedPlayerCount: number;
   ambiguousPlayerCount: number;
   title: string;
-}> {
-  const externalEventId = String(event.externalEventId);
-  const division = String(event.division) || "masters";
-  const jsonUrl = standingsJsonUrl(externalEventId, division);
-  const pageUrl = standingsPageUrl(externalEventId, division);
-  const [jsonBody, pageHtml] = await Promise.all([fetchText(jsonUrl), fetchText(pageUrl)]);
-
-  replaceSourcePayload(ctx, "pairings-json", event.id, jsonBody);
-
+} {
   const parsed = parsePairingsPayload(jsonBody);
-  const htmlRound = parseCurrentRoundFromHtml(pageHtml);
+  const htmlRound = pageHtml ? parseCurrentRoundFromHtml(pageHtml) : null;
   const currentRound = htmlRound ?? parsed.currentRound;
-  const title = parseEventTitleFromHtml(pageHtml) || String(event.title);
+  const title = (pageHtml ? parseEventTitleFromHtml(pageHtml) : "") || String(event.title);
 
   const existingPairings = ctx.db.pairings.where("eventId", event.id).all();
   deleteAllRows(ctx, "pairings", existingPairings);
@@ -462,6 +509,44 @@ async function importPairingsForEvent(ctx: ServerContext, event: TableRow): Prom
     ambiguousPlayerCount: ambiguous,
     title
   };
+}
+
+async function importPairingsForEvent(
+  ctx: ServerContext,
+  event: TableRow,
+  options?: { force?: boolean }
+): Promise<{
+  roundNumber: number;
+  pairingCount: number;
+  unmatchedPlayerCount: number;
+  ambiguousPlayerCount: number;
+  title: string;
+  fromCache: boolean;
+}> {
+  const externalEventId = String(event.externalEventId);
+  const division = String(event.division) || "masters";
+
+  if (!options?.force && pairingsCacheFresh(ctx, event.id)) {
+    const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id);
+    if (cached) {
+      ctx.log.info("pairings served from cache", {
+        externalEventId,
+        fetchedAt: String(cached.fetchedAt)
+      });
+
+      const result = applyPairingsPayload(ctx, event, String(cached.body), null);
+      return { ...result, fromCache: true };
+    }
+  }
+
+  const jsonUrl = standingsJsonUrl(externalEventId, division);
+  const pageUrl = standingsPageUrl(externalEventId, division);
+  const [jsonBody, pageHtml] = await Promise.all([fetchText(jsonUrl), fetchText(pageUrl)]);
+
+  replaceSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id, jsonBody);
+
+  const result = applyPairingsPayload(ctx, event, jsonBody, pageHtml);
+  return { ...result, fromCache: false };
 }
 
 export default capsule({
@@ -587,8 +672,6 @@ export default capsule({
 
   mutations: {
     configureEvent: mutation((ctx, externalEventId: string, sourceUrl: string, division: string) => {
-      assertAdmin(ctx as ServerContext);
-
       const parsedId = extractExternalEventId(externalEventId);
       const normalizedDivision = division.trim().toLowerCase() || "masters";
 
@@ -650,7 +733,6 @@ export default capsule({
     }),
 
     refreshChampionshipPoints: mutation(async (ctx) => {
-      assertAdmin(ctx as ServerContext);
       const serverCtx = ctx as ServerContext;
 
       serverCtx.log.info("championship points refresh started", {});
@@ -672,7 +754,6 @@ export default capsule({
     }),
 
     refreshPairings: mutation(async (ctx) => {
-      assertAdmin(ctx as ServerContext);
       const serverCtx = ctx as ServerContext;
       const event = getActiveEvent(serverCtx);
 
@@ -738,7 +819,6 @@ export default capsule({
     }),
 
     refreshAll: mutation(async (ctx) => {
-      assertAdmin(ctx as ServerContext);
       const serverCtx = ctx as ServerContext;
       const event = getActiveEvent(serverCtx);
 
@@ -749,19 +829,30 @@ export default capsule({
       let championshipPointsUpdated = false;
       let championshipPointsCount = serverCtx.db.championshipPointsPlayers.all().length;
 
-      if (championshipPointsAreStale(serverCtx)) {
+      let championshipPointsFromCache = false;
+      let pairingsFromCache = false;
+
+      if (!championshipPointsCacheFresh(serverCtx)) {
         try {
           const cpResult = await importChampionshipPoints(serverCtx);
-          championshipPointsUpdated = true;
+          championshipPointsUpdated = !cpResult.fromCache;
           championshipPointsCount = cpResult.playerCount;
+          championshipPointsFromCache = cpResult.fromCache;
         } catch (error) {
           serverCtx.log.warn("refreshAll championship points skipped", {
             message: error instanceof Error ? error.message : String(error)
           });
         }
+      } else {
+        championshipPointsFromCache = true;
+        championshipPointsCount = serverCtx.db.championshipPointsPlayers.all().length;
+        serverCtx.log.info("refreshAll championship points from cache", {
+          playerCount: championshipPointsCount
+        });
       }
 
       const pairingsResult = await importPairingsForEvent(serverCtx, event);
+      pairingsFromCache = pairingsResult.fromCache;
       const now = new Date().toISOString();
 
       serverCtx.db.refreshRuns.insert({
@@ -784,7 +875,9 @@ export default capsule({
         pairingsCount: pairingsResult.pairingCount,
         roundNumber: pairingsResult.roundNumber,
         unmatchedPlayerCount: pairingsResult.unmatchedPlayerCount,
-        ambiguousPlayerCount: pairingsResult.ambiguousPlayerCount
+        ambiguousPlayerCount: pairingsResult.ambiguousPlayerCount,
+        championshipPointsFromCache,
+        pairingsFromCache
       };
 
       serverCtx.log.info("refreshAll completed", result);
@@ -799,8 +892,7 @@ export default capsule({
         leaderboardNormalizedName: string,
         leaderboardCountry: string
       ) => {
-        assertAdmin(ctx as ServerContext);
-        const serverCtx = ctx as ServerContext;
+          const serverCtx = ctx as ServerContext;
 
         const tournamentName = tournamentNormalizedName.trim();
         const leaderboardName = leaderboardNormalizedName.trim();
