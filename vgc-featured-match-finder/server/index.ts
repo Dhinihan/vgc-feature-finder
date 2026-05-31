@@ -619,14 +619,6 @@ function isPairingsJsonChunkIndex(chunkIndex: string): boolean {
   );
 }
 
-function countPairingsJsonRowSlices(ctx: ServerContext, eventId: string): number {
-  return ctx.db.pairingsChunks
-    .where("eventId", eventId)
-    .all()
-    .filter((row) => String(row.chunkIndex).startsWith(`${PAIRINGS_JSON_SLICE_PREFIX}row-`))
-    .length;
-}
-
 function readPairingsJsonRowSlice(ctx: ServerContext, eventId: string, rowSliceIndex: number): string {
   const row = ctx.db.pairingsChunks
     .where("eventId", eventId)
@@ -640,18 +632,31 @@ function readPairingsJsonRowSlice(ctx: ServerContext, eventId: string, rowSliceI
   return String(row.body);
 }
 
-function appendPairingsJsonToRowSlices(ctx: ServerContext, eventId: string, chunk: string): number {
-  const rowRows = ctx.db.pairingsChunks
-    .where("eventId", eventId)
-    .all()
-    .filter((row) => String(row.chunkIndex).startsWith(`${PAIRINGS_JSON_SLICE_PREFIX}row-`))
-    .sort((left, right) => {
-      const leftIndex = Number.parseInt(String(left.chunkIndex).split("-").pop() ?? "0", 10);
-      const rightIndex = Number.parseInt(String(right.chunkIndex).split("-").pop() ?? "0", 10);
-      return leftIndex - rightIndex;
-    });
+function readLastPairingsJsonRowSlice(
+  ctx: ServerContext,
+  eventId: string,
+  lastRowIndex: number
+): TableRow | null {
+  if (lastRowIndex < 0) {
+    return null;
+  }
 
-  let lastRow = rowRows.at(-1) ?? null;
+  return (
+    ctx.db.pairingsChunks
+      .where("eventId", eventId)
+      .all()
+      .find((row) => String(row.chunkIndex) === pairingsJsonRowSliceKey(lastRowIndex)) ?? null
+  );
+}
+
+function appendPairingsJsonToRowSlices(
+  ctx: ServerContext,
+  eventId: string,
+  chunk: string,
+  knownRowSliceCount: number
+): number {
+  let lastRowIndex = knownRowSliceCount - 1;
+  let lastRow = readLastPairingsJsonRowSlice(ctx, eventId, lastRowIndex);
   let remaining = chunk;
   const maxRowWrites = Math.ceil(chunk.length / LAKEBED_MAX_ROW_BYTES) + 2;
 
@@ -667,6 +672,7 @@ function appendPairingsJsonToRowSlices(ctx: ServerContext, eventId: string, chun
       if (lastRow) {
         ctx.db.pairingsChunks.update(lastRow.id, { body: updatedBody });
       } else {
+        lastRowIndex = 0;
         lastRow = ctx.db.pairingsChunks.insert({
           eventId,
           chunkIndex: pairingsJsonRowSliceKey(0),
@@ -679,20 +685,18 @@ function appendPairingsJsonToRowSlices(ctx: ServerContext, eventId: string, chun
       break;
     }
 
-    const nextIndex = lastRow
-      ? Number.parseInt(String(lastRow.chunkIndex).split("-").pop() ?? "0", 10) + 1
-      : 0;
+    lastRowIndex += 1;
     const part = remaining.slice(0, LAKEBED_MAX_ROW_BYTES);
     remaining = remaining.slice(part.length);
 
     lastRow = ctx.db.pairingsChunks.insert({
       eventId,
-      chunkIndex: pairingsJsonRowSliceKey(nextIndex),
+      chunkIndex: pairingsJsonRowSliceKey(lastRowIndex),
       body: part
     });
   }
 
-  return countPairingsJsonRowSlices(ctx, eventId);
+  return lastRowIndex + 1;
 }
 
 type PairingsPrepState = {
@@ -802,8 +806,30 @@ async function probePairingsJsonSize(
     }
   }
 
-  const body = await fetchText(url);
-  return { totalBytes: body.length, fetchSliceCount: 1, singleFetch: true };
+  const contentLengthHeader = probe.headers.get("Content-Length");
+  const contentLength = contentLengthHeader
+    ? Number.parseInt(contentLengthHeader, 10)
+    : Number.NaN;
+
+  if (!Number.isNaN(contentLength) && contentLength > 0) {
+    if (contentLength > LAKEBED_MAX_FETCH_BYTES) {
+      return {
+        totalBytes: contentLength,
+        fetchSliceCount: Math.ceil(contentLength / LAKEBED_MAX_FETCH_BYTES),
+        singleFetch: false
+      };
+    }
+
+    return { totalBytes: contentLength, fetchSliceCount: 1, singleFetch: true };
+  }
+
+  // Avoid downloading the full standings JSON when Range probing is unavailable.
+  const assumedBytes = 2_000_000;
+  return {
+    totalBytes: assumedBytes,
+    fetchSliceCount: Math.ceil(assumedBytes / LAKEBED_MAX_FETCH_BYTES),
+    singleFetch: false
+  };
 }
 
 async function fetchPairingsJsonSliceBody(
@@ -934,7 +960,12 @@ async function fetchPairingsJsonSlice(
     meta.fetchSliceCount === 1 && meta.totalBytes <= LAKEBED_MAX_FETCH_BYTES
   );
 
-  const rowSliceCount = appendPairingsJsonToRowSlices(ctx, event.id, body);
+  const rowSliceCount = appendPairingsJsonToRowSlices(
+    ctx,
+    event.id,
+    body,
+    meta.rowSliceCount
+  );
   meta = {
     ...meta,
     rowSliceCount,
@@ -1796,14 +1827,8 @@ export default capsule({
   },
 
   queries: {
-    eventDashboard: query(async (ctx) => {
+    eventDashboard: query((ctx) => {
       const serverCtx = ctx as ServerContext;
-      const event = getActiveEvent(serverCtx);
-
-      if (event) {
-        await syncCurrentRoundFromPokeData(serverCtx, event);
-      }
-
       return buildEventDashboard(serverCtx, { pendingOnly: false });
     }),
 
