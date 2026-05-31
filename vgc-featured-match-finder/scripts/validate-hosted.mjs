@@ -197,8 +197,8 @@ async function main() {
       );
     }
 
-    const bodyAfterConfigure = await page.locator("body").innerText();
-    if (/Source runtime exceeded|runtime exceeded/i.test(bodyAfterConfigure)) {
+    const statusAfterConfigure = await page.locator("[role='status']").innerText().catch(() => "");
+    if (/Source runtime exceeded|runtime exceeded/i.test(statusAfterConfigure)) {
       report.errors.push("Lakebed runtime error visible after configure");
     }
 

@@ -36,6 +36,7 @@ import {
   buildTournamentRecordIndexRaw,
   countPairingsInRound,
   detectCurrentRoundFromPayload,
+  detectCurrentRoundFromRawJson,
   extractPairingsForRoundRaw,
   mergeExtractedPairings,
   mergeTournamentRecordIndexes,
@@ -1277,19 +1278,27 @@ function resolvePairingsTargetRound(
     : resolveCurrentRound(null, Math.max(standingsRoundFromBody, storedRound));
 }
 
-function beginPreparePairingsFromJsonSlices(
+async function beginPreparePairingsFromJsonSlices(
   ctx: ServerContext,
   event: TableRow
-): { targetRound: number; parseBatchTotal: number } {
+): Promise<{ targetRound: number; parseBatchTotal: number }> {
   const jsonMeta = readPairingsJsonMeta(ctx, event.id);
 
   if (!jsonMeta || jsonMeta.rowSliceCount < 1) {
     throw new Error("pairings JSON slices not fetched");
   }
 
-  const targetRound = parseEventRound(
-    String(getActiveEvent(ctx)?.currentRound ?? event.currentRound)
-  );
+  await syncCurrentRoundFromPokeData(ctx, event);
+  const activeEvent = getActiveEvent(ctx) ?? event;
+
+  const firstSlice = readPairingsJsonRowSlice(ctx, event.id, 0);
+  const lastSlice =
+    jsonMeta.rowSliceCount > 1
+      ? readPairingsJsonRowSlice(ctx, event.id, jsonMeta.rowSliceCount - 1)
+      : "";
+  const jsonRound = detectCurrentRoundFromRawJson(`${firstSlice}${lastSlice}`);
+  const syncedRound = parseEventRound(String(activeEvent.currentRound));
+  const targetRound = Math.max(syncedRound, jsonRound);
 
   if (targetRound < 1) {
     throw new Error("current round is unknown; sync round before importing pairings");
