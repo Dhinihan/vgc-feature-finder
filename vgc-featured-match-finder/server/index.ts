@@ -31,8 +31,8 @@ import {
   resolveCurrentRound,
   parseEventTitleFromHtml,
   countPairingsInRound,
+  detectCurrentRoundFromPayload,
   parsePairingsForRound,
-  parsePairingsPayload,
   parsePlayerLabel
 } from "../shared/parsing";
 import { rankPairings } from "../shared/scoring";
@@ -579,7 +579,7 @@ function applyPairingsPayload(
   title: string;
 } {
   const htmlRound = pageHtml ? parseCurrentRoundFromHtml(pageHtml) : null;
-  const standingsRound = parsePairingsPayload(jsonBody).currentRound;
+  const standingsRound = detectCurrentRoundFromPayload(jsonBody);
   const currentRound = resolveCurrentRound(htmlRound, standingsRound);
   const pairings = parsePairingsForRound(jsonBody, currentRound);
   const title = (pageHtml ? parseEventTitleFromHtml(pageHtml) : "") || String(event.title);
@@ -632,8 +632,29 @@ async function importPairingsForEvent(
   const jsonUrl = standingsJsonUrl(externalEventId, division);
   let jsonBody = "";
   let fromCache = false;
+  let pageHtml: string | null = null;
+  let htmlRound: number | null = null;
+
+  if (options?.fetchPageHtml !== false) {
+    pageHtml = await fetchText(standingsPageUrl(externalEventId, division));
+    htmlRound = parseCurrentRoundFromHtml(pageHtml);
+
+    if (htmlRound !== null) {
+      const titleFromHtml = parseEventTitleFromHtml(pageHtml);
+      ctx.db.events.update(event.id, {
+        currentRound: String(htmlRound),
+        lastRefreshAt: new Date().toISOString(),
+        ...(titleFromHtml ? { title: titleFromHtml } : {})
+      });
+      ctx.log.info("current round synced from PokéData HTML", {
+        externalEventId,
+        htmlRound
+      });
+    }
+  }
+
   const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id);
-  const standingsRound = cached ? parsePairingsPayload(String(cached.body)).currentRound : null;
+  const standingsRound = cached ? detectCurrentRoundFromPayload(String(cached.body)) : null;
 
   if (
     !options?.force &&
@@ -652,11 +673,6 @@ async function importPairingsForEvent(
   } else {
     jsonBody = await fetchText(jsonUrl);
     replaceSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id, jsonBody);
-  }
-
-  let pageHtml: string | null = null;
-  if (options?.fetchPageHtml) {
-    pageHtml = await fetchText(standingsPageUrl(externalEventId, division));
   }
 
   const result = applyPairingsPayload(ctx, event, jsonBody, pageHtml);
