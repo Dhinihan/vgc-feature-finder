@@ -8,6 +8,7 @@ import {
   parsePairingsPayload,
   resolveCurrentRound
 } from "./parsing";
+import { needsPairingsRefresh, resolveDisplayRound } from "./round-resolution";
 import { rankPairings, scorePairing } from "./scoring";
 import type { ChampionshipPointsPlayer, Pairing, PlayerOverride } from "./domain";
 
@@ -206,6 +207,12 @@ export function runSmokeTests(): string[] {
   assert(parsedRound.pairings[0].playerA.tournamentRecord === "1-0", "player A tournament record");
   assert(parsedRound.pairings[0].playerB?.tournamentRecord === "0-1", "player B tournament record");
 
+
+  assert(resolveDisplayRound(11, 10, [10]) === 10, "display falls back to imported round");
+  assert(resolveDisplayRound(11, 11, [11]) === 11, "display uses live when imported");
+  assert(needsPairingsRefresh(11, 10, 72), "refresh when live ahead of display");
+  assert(!needsPairingsRefresh(11, 11, 72), "no refresh when in sync");
+  assert(needsPairingsRefresh(11, 11, 0), "refresh when empty table");
 
   const cpHtml = `<tr><td>1</td><td><div class="player">Dylan Matthews</div></td><td><div class="country">USA</div></td><td class="point"><div class="cp">1332</div><div class="pp">30</div></td></tr>`;
   const fromHtml = parseChampionshipPointsPayload(cpHtml);
