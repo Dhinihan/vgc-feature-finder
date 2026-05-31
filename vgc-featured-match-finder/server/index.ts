@@ -394,6 +394,46 @@ function countUnmatchedPlayers(pairings: RankedPairing[]): {
   return { unmatched: unmatchedNames.size, ambiguous: ambiguousNames.size };
 }
 
+async function syncCurrentRoundFromPokeData(
+  ctx: ServerContext,
+  event: TableRow
+): Promise<number | null> {
+  const externalEventId = String(event.externalEventId);
+  const division = String(event.division) || "masters";
+
+  try {
+    const html = await fetchText(standingsPageUrl(externalEventId, division));
+    const htmlRound = parseCurrentRoundFromHtml(html);
+
+    if (htmlRound === null) {
+      ctx.log.warn("could not parse current round from PokéData HTML", { externalEventId });
+      return null;
+    }
+
+    const storedRound = Number.parseInt(String(event.currentRound), 10) || 0;
+    const titleFromHtml = parseEventTitleFromHtml(html);
+
+    if (htmlRound !== storedRound || titleFromHtml) {
+      ctx.db.events.update(event.id, {
+        currentRound: String(htmlRound),
+        lastRefreshAt: new Date().toISOString(),
+        ...(titleFromHtml ? { title: titleFromHtml } : {})
+      });
+      ctx.log.info("current round synced from PokéData HTML", {
+        externalEventId,
+        previousRound: storedRound,
+        htmlRound
+      });
+    }
+
+    return htmlRound;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.log.warn("failed to fetch PokéData HTML for round sync", { externalEventId, message });
+    return null;
+  }
+}
+
 function buildEventDashboard(
   ctx: ServerContext,
   options: { pendingOnly: boolean }
@@ -580,7 +620,11 @@ function applyPairingsPayload(
 } {
   const htmlRound = pageHtml ? parseCurrentRoundFromHtml(pageHtml) : null;
   const standingsRound = detectCurrentRoundFromPayload(jsonBody);
-  const currentRound = resolveCurrentRound(htmlRound, standingsRound);
+  const storedRound = Number.parseInt(String(event.currentRound), 10) || 0;
+  const currentRound =
+    htmlRound !== null
+      ? Math.max(htmlRound, standingsRound, storedRound)
+      : resolveCurrentRound(null, Math.max(standingsRound, storedRound));
   const pairings = parsePairingsForRound(jsonBody, currentRound);
   const title = (pageHtml ? parseEventTitleFromHtml(pageHtml) : "") || String(event.title);
 
@@ -675,10 +719,34 @@ async function importPairingsForEvent(
     replaceSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id, jsonBody);
   }
 
-  const result = applyPairingsPayload(ctx, event, jsonBody, pageHtml);
-  return { ...result, fromCache };
+  try {
+    const result = applyPairingsPayload(ctx, event, jsonBody, pageHtml);
+    return { ...result, fromCache };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const roundNumber =
+      htmlRound ?? (Number.parseInt(String(event.currentRound), 10) || 0);
+    const pairingCount = ctx.db.pairings.where("eventId", event.id).all().length;
 
+    ctx.log.error("pairings import failed after round sync", {
+      externalEventId,
+      roundNumber,
+      message
+    });
 
+    if (htmlRound !== null) {
+      return {
+        roundNumber,
+        pairingCount,
+        unmatchedPlayerCount: 0,
+        ambiguousPlayerCount: 0,
+        title: String(event.title),
+        fromCache
+      };
+    }
+
+    throw error;
+  }
 }
 
 export default capsule({
@@ -749,7 +817,16 @@ export default capsule({
   },
 
   queries: {
-    eventDashboard: query((ctx) => buildEventDashboard(ctx as ServerContext, { pendingOnly: false })),
+    eventDashboard: query(async (ctx) => {
+      const serverCtx = ctx as ServerContext;
+      const event = getActiveEvent(serverCtx);
+
+      if (event) {
+        await syncCurrentRoundFromPokeData(serverCtx, event);
+      }
+
+      return buildEventDashboard(serverCtx, { pendingOnly: false });
+    }),
 
     unmatchedPlayers: query((ctx) => {
       const serverCtx = ctx as ServerContext;
@@ -856,17 +933,20 @@ export default capsule({
           eventId: duplicate.id
         });
 
-        const refreshed = await importPairingsForEvent(
-          serverCtx,
-          {
-            ...duplicate,
-            externalEventId: parsedId,
-            sourceUrl: resolvedSourceUrl,
-            division: normalizedDivision,
-            isActive: true
-          },
-          { force: true, fetchPageHtml: true }
-        );
+        const eventRow = {
+          ...duplicate,
+          externalEventId: parsedId,
+          sourceUrl: resolvedSourceUrl,
+          division: normalizedDivision,
+          isActive: true
+        };
+
+        await syncCurrentRoundFromPokeData(serverCtx, eventRow);
+
+        const refreshed = await importPairingsForEvent(serverCtx, eventRow, {
+          force: true,
+          fetchPageHtml: true
+        });
 
         return { eventId: duplicate.id, ...refreshed };
       }
@@ -887,12 +967,31 @@ export default capsule({
         eventId: created.id
       });
 
+      await syncCurrentRoundFromPokeData(serverCtx, created);
+
       const refreshed = await importPairingsForEvent(serverCtx, created, {
         force: true,
         fetchPageHtml: true
       });
 
       return { eventId: created.id, ...refreshed };
+    }),
+
+    syncCurrentRound: mutation(async (ctx) => {
+      const serverCtx = ctx as ServerContext;
+      const event = getActiveEvent(serverCtx);
+
+      if (!event) {
+        throw new Error("no active event");
+      }
+
+      const roundNumber = await syncCurrentRoundFromPokeData(serverCtx, event);
+
+      if (roundNumber === null) {
+        throw new Error("could not read current round from PokéData");
+      }
+
+      return { roundNumber };
     }),
 
     refreshChampionshipPoints: mutation((ctx) => {
@@ -929,6 +1028,7 @@ export default capsule({
       serverCtx.log.info("pairings refresh started", { externalEventId, division });
 
       try {
+        await syncCurrentRoundFromPokeData(serverCtx, event);
         const result = await importPairingsForEvent(serverCtx, event, {
           force: true,
           fetchPageHtml: true

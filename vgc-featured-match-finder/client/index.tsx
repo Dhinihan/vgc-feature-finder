@@ -1,5 +1,5 @@
 import { useAuth, useMutation, useQuery } from "lakebed/client";
-import { useMemo, useState } from "preact/hooks";
+import { useEffect, useMemo, useState } from "preact/hooks";
 import type { ChampionshipPointsMeta, EventDashboard } from "../shared/domain";
 
 type UnmatchedPlayer = {
@@ -115,6 +115,7 @@ export function App() {
   const cpMeta = useQuery<ChampionshipPointsMeta>("championshipPointsMeta");
 
   const configureEvent = useMutation<[string, string, string], { eventId: string }>("configureEvent");
+  const syncCurrentRound = useMutation<[], { roundNumber: number }>("syncCurrentRound");
   const refreshPairings = useMutation<
     [],
     {
@@ -137,6 +138,16 @@ export function App() {
     leaderboardNormalizedName: "",
     leaderboardCountry: "*"
   });
+
+  useEffect(() => {
+    if (!dashboard.event) {
+      return;
+    }
+
+    void syncCurrentRound().catch(() => {
+      // eventDashboard query also syncs round from PokéData HTML
+    });
+  }, [dashboard.event?.id, dashboard.event?.externalEventId]);
 
   const filteredPairings = useMemo(() => {
     let rows = dashboard.rankedPairings;
@@ -181,10 +192,12 @@ export function App() {
     setStatusMessage("Atualizando partidas no PokéData...");
 
     try {
+      const roundSync = await syncCurrentRound();
       const result = await refreshPairings();
+      const roundNumber = Math.max(roundSync.roundNumber, result.roundNumber);
       const cpCount = cpMeta?.playerCount ?? 0;
       setStatusMessage(
-        `Atualização concluída. Rodada ${result.roundNumber}, ${result.pairingCount} partidas. CP no banco: ${formatNumber(cpCount)}.`
+        `Atualização concluída. Rodada ${roundNumber}, ${result.pairingCount} partidas. CP no banco: ${formatNumber(cpCount)}.`
       );
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : "Falha na atualização.");

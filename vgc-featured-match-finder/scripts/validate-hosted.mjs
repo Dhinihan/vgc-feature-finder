@@ -97,7 +97,7 @@ async function main() {
     await page.getByRole("button", { name: /Salvar evento/i }).click();
     report.steps.push("configured event");
 
-    const roundAfterConfigure = await waitForRound(page, expected.current, 120_000);
+    const roundAfterConfigure = await waitForRound(page, expected.current, 30_000);
     report.roundAfterConfigure = roundAfterConfigure;
 
     if (roundAfterConfigure !== expected.current) {
