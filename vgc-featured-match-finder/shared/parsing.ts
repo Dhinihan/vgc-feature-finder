@@ -217,7 +217,7 @@ const STANDING_PLAYER_NAME_PATTERN =
 function buildTournamentRecordIndexRaw(payload: string): Map<string, string> {
   const index = new Map<string, string>();
   const playerPattern =
-    /"name"\s*:\s*"([^"]+ \[[A-Z]{2,3}\])"\s*,\s*"record"\s*:\s*\{\s*"wins"\s*:\s*(\d+)\s*,\s*"losses"\s*:\s*(\d+)\s*,\s*"ties"\s*:\s*(\d+)/g;
+    /"name"\s*:\s*"([^"]+ \[[A-Z]{2,3}\])"\s*,\s*(?:"placing"\s*:\s*\d+\s*,\s*)?"record"\s*:\s*\{\s*"wins"\s*:\s*(\d+)\s*,\s*"losses"\s*:\s*(\d+)\s*,\s*"ties"\s*:\s*(\d+)/g;
 
   for (const match of payload.matchAll(playerPattern)) {
     const label = parsePlayerLabel(match[1]);

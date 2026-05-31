@@ -173,6 +173,32 @@ export function runSmokeTests(): string[] {
   assert(detectCurrentRoundFromRawJson(liveRoundPayload) === 9, "raw pending round 9");
   assert(extractPairingsForRoundRaw(liveRoundPayload, 8).length === 1, "raw pairings extraction");
 
+  const placingBeforeRecordPayload = JSON.stringify([
+    {
+      name: "Top [US]",
+      placing: 1,
+      record: { wins: 9, losses: 0, ties: 0 },
+      rounds: {
+        "10": { name: "Rival [US]", result: null, table: 1 }
+      }
+    },
+    {
+      name: "Rival [US]",
+      placing: 2,
+      record: { wins: 7, losses: 2, ties: 0 },
+      rounds: {
+        "10": { name: "Top [US]", result: null, table: 1 }
+      }
+    }
+  ]);
+  const rawWithPlacing = extractPairingsForRoundRaw(placingBeforeRecordPayload, 10);
+  assert(rawWithPlacing.length === 1, "raw pairings with placing field");
+  const rawRecords = [
+    rawWithPlacing[0].playerA.tournamentRecord,
+    rawWithPlacing[0].playerB?.tournamentRecord
+  ].sort();
+  assert(rawRecords[0] === "7-2" && rawRecords[1] === "9-0", "raw records with placing field");
+
   const parsedRound = parsePairingsPayload(pairingsPayload);
   assert(parsedRound.pairings.length === 1, "pairings dedupe");
   assert(parsedRound.pairings[0].result === "W", "pairings keep W/L result");
