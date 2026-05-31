@@ -42,10 +42,18 @@ async function readStatusRound(page) {
 }
 
 async function readPartidasStat(page) {
-  const cards = page.locator("section").filter({ hasText: "Partidas" });
-  const value = await cards.locator("p.text-2xl").first().textContent().catch(() => null);
+  const label = page.locator("p.text-xs.uppercase", { hasText: /^Partidas$/ });
+  const value = await label.locator("..").locator("p.text-2xl").first().textContent().catch(() => null);
   const parsed = Number.parseInt(String(value ?? "").trim(), 10);
   return Number.isNaN(parsed) ? null : parsed;
+}
+
+async function readFeaturedPairingsRowCount(page) {
+  const table = page
+    .locator("section")
+    .filter({ has: page.getByRole("heading", { name: /Partidas em destaque/i }) })
+    .locator("table tbody tr");
+  return table.count();
 }
 
 async function waitForRound(page, expectedRound, timeoutMs) {
@@ -143,9 +151,10 @@ async function main() {
     report.roundAfterRefresh = roundAfterRefresh;
     report.statusRound = await readStatusRound(page);
     report.partidasStat = await readPartidasStat(page);
-    report.tableRows = await page.locator("table tbody tr").count();
-    report.hasScore = /Score|completo|CP ausente/i.test(await page.locator("body").innerText());
-    report.hasPairingsTable = report.tableRows > 0;
+    report.featuredPairingsRows = await readFeaturedPairingsRowCount(page);
+    report.tableRows = report.featuredPairingsRows;
+    report.hasScore = /Relevância|completo|CP ausente/i.test(await page.locator("body").innerText());
+    report.hasPairingsTable = report.featuredPairingsRows > 1;
 
     if (roundAfterRefresh !== expected.current) {
       report.errors.push(

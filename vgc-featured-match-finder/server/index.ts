@@ -501,6 +501,9 @@ function buildEventDashboard(
   };
 }
 
+/** Lakebed caps each outbound fetch body at 1 MiB; PokéData standings JSON is larger. */
+const LAKEBED_MAX_FETCH_BYTES = 1_000_000;
+
 async function fetchText(url: string, init?: RequestInit): Promise<string> {
   const response = await fetch(url, init);
 
@@ -509,6 +512,42 @@ async function fetchText(url: string, init?: RequestInit): Promise<string> {
   }
 
   return response.text();
+}
+
+function parseContentRangeTotal(contentRange: string | null): number | null {
+  if (!contentRange) {
+    return null;
+  }
+
+  const match = contentRange.match(/\/(\d+)$/);
+  if (!match) {
+    return null;
+  }
+
+  const total = Number.parseInt(match[1], 10);
+  return Number.isNaN(total) ? null : total;
+}
+
+async function fetchTextLarge(url: string): Promise<string> {
+  const probe = await fetch(url, { headers: { Range: "bytes=0-0" } });
+
+  if (probe.status === 206) {
+    const totalBytes = parseContentRangeTotal(probe.headers.get("Content-Range"));
+
+    if (totalBytes !== null && totalBytes > LAKEBED_MAX_FETCH_BYTES) {
+      const parts: string[] = [];
+
+      for (let start = 0; start < totalBytes; start += LAKEBED_MAX_FETCH_BYTES) {
+        const end = Math.min(start + LAKEBED_MAX_FETCH_BYTES - 1, totalBytes - 1);
+        const part = await fetchText(url, { headers: { Range: `bytes=${start}-${end}` } });
+        parts.push(part);
+      }
+
+      return parts.join("");
+    }
+  }
+
+  return fetchText(url);
 }
 
 function standingsJsonUrl(externalEventId: string, division: string): string {
@@ -797,7 +836,7 @@ async function preparePairingsStaging(
   ) {
     jsonBody = String(cached.body);
   } else {
-    jsonBody = await fetchText(jsonUrl);
+    jsonBody = await fetchTextLarge(jsonUrl);
     replaceSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id, jsonBody);
   }
 
@@ -831,7 +870,8 @@ async function preparePairingsStaging(
     externalEventId,
     roundNumber,
     pairingCount: parsedPairings.length,
-    chunkTotal
+    chunkTotal,
+    jsonByteLength: jsonBody.length
   });
 
   return {
@@ -1045,7 +1085,7 @@ async function importPairingsForEvent(
       roundNumber: standingsRound
     });
   } else {
-    jsonBody = await fetchText(jsonUrl);
+    jsonBody = await fetchTextLarge(jsonUrl);
     replaceSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id, jsonBody);
   }
 
