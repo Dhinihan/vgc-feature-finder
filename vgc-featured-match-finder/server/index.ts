@@ -19,6 +19,7 @@ import type {
   TournamentPlayer
 } from "../shared/domain";
 import { expandCpPlayers, type CompactCpRow } from "../shared/cp-storage";
+import { compactPairing, expandCompactPairing, type CompactPairingRow } from "../shared/pairings-storage";
 import { createLeaderboardIndex, matchPlayerWithLeaderboardIndex } from "../shared/leaderboard-index";
 import type { LeaderboardIndex } from "../shared/leaderboard-index";
 import { readStoredBoolean } from "../shared/stored-boolean";
@@ -51,6 +52,8 @@ const PAYLOAD_SOURCE = {
   pairingsJson: "pairings-json"
 } as const;
 const REFRESH_RUN_LIMIT = 20;
+const PAIRINGS_STAGING_META = "meta";
+const PAIRINGS_ROWS_PER_COMMIT = 6;
 const WILDCARD_COUNTRY = "*";
 const MAX_PERSISTED_PAYLOAD_BYTES = 60_000;
 
@@ -103,6 +106,19 @@ function deleteAllRows(ctx: ServerContext, tableName: string, rows: TableRow[]):
   for (const row of rows) {
     table.delete(row.id);
   }
+}
+
+function getLatestRunningRefreshRun(
+  ctx: ServerContext,
+  eventId: string
+): TableRow | null {
+  const runs = ctx.db.refreshRuns
+    .where("eventId", eventId)
+    .orderBy("createdAt", "desc")
+    .all()
+    .filter((row) => String(row.status) === "running");
+
+  return runs[0] ?? null;
 }
 
 function trimRefreshRuns(ctx: ServerContext, eventId: string): void {
@@ -604,6 +620,320 @@ function clearEventPairingData(ctx: ServerContext, eventId: string): void {
     .all()
     .filter((row) => String(row.eventId) === eventId);
   deleteAllRows(ctx, "sourcePayloads", payloads);
+
+  clearPairingsChunks(ctx, eventId);
+}
+
+type PairingsStagingMeta = {
+  roundNumber: number;
+  pairingCount: number;
+  chunkTotal: number;
+  title: string;
+  importedAt: string;
+};
+
+function clearPairingsChunks(ctx: ServerContext, eventId: string): void {
+  const rows = ctx.db.pairingsChunks.where("eventId", eventId).all();
+  deleteAllRows(ctx, "pairingsChunks", rows);
+}
+
+function readPairingsStagingMeta(ctx: ServerContext, eventId: string): PairingsStagingMeta | null {
+  const row = ctx.db.pairingsChunks
+    .where("eventId", eventId)
+    .all()
+    .find((item) => String(item.chunkIndex) === PAIRINGS_STAGING_META);
+
+  if (!row) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(String(row.body)) as PairingsStagingMeta;
+  } catch {
+    return null;
+  }
+}
+
+function writePairingsStagingMeta(ctx: ServerContext, eventId: string, meta: PairingsStagingMeta): void {
+  const existing = ctx.db.pairingsChunks
+    .where("eventId", eventId)
+    .all()
+    .filter((item) => String(item.chunkIndex) === PAIRINGS_STAGING_META);
+  deleteAllRows(ctx, "pairingsChunks", existing);
+
+  ctx.db.pairingsChunks.insert({
+    eventId,
+    chunkIndex: PAIRINGS_STAGING_META,
+    body: JSON.stringify(meta)
+  });
+}
+
+function chunkPairingRowsByCount(rows: CompactPairingRow[], size: number): CompactPairingRow[][] {
+  const chunks: CompactPairingRow[][] = [];
+
+  for (let index = 0; index < rows.length; index += size) {
+    chunks.push(rows.slice(index, index + size));
+  }
+
+  return chunks;
+}
+
+function storePairingsStagingChunks(
+  ctx: ServerContext,
+  eventId: string,
+  compactRows: CompactPairingRow[]
+): number {
+  clearPairingsChunks(ctx, eventId);
+
+  const chunks =
+    compactRows.length <= PAIRINGS_ROWS_PER_COMMIT
+      ? [compactRows]
+      : chunkPairingRowsByCount(compactRows, PAIRINGS_ROWS_PER_COMMIT);
+
+  for (let index = 0; index < chunks.length; index++) {
+    ctx.db.pairingsChunks.insert({
+      eventId,
+      chunkIndex: String(index),
+      body: JSON.stringify(chunks[index])
+    });
+  }
+
+  return chunks.length;
+}
+
+function loadPairingsStagingChunk(
+  ctx: ServerContext,
+  eventId: string,
+  chunkIndex: number
+): CompactPairingRow[] {
+  const row = ctx.db.pairingsChunks
+    .where("eventId", eventId)
+    .all()
+    .find((item) => String(item.chunkIndex) === String(chunkIndex));
+
+  if (!row) {
+    return [];
+  }
+
+  const parsed = JSON.parse(String(row.body)) as CompactPairingRow[];
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function finalizePairingsImport(
+  ctx: ServerContext,
+  event: TableRow,
+  meta: PairingsStagingMeta
+): {
+  roundNumber: number;
+  pairingCount: number;
+  unmatchedPlayerCount: number;
+  ambiguousPlayerCount: number;
+  title: string;
+} {
+  const now = new Date().toISOString();
+  ctx.db.events.update(event.id, {
+    currentRound: String(meta.roundNumber),
+    title: meta.title || String(event.title),
+    lastRefreshAt: now
+  });
+
+  clearPairingsChunks(ctx, event.id);
+
+  const ranked = rankPairings(
+    buildPairings(ctx, { ...event, currentRound: String(meta.roundNumber) })
+  );
+  const { unmatched, ambiguous } = countUnmatchedPlayers(ranked);
+
+  return {
+    roundNumber: meta.roundNumber,
+    pairingCount: meta.pairingCount,
+    unmatchedPlayerCount: unmatched,
+    ambiguousPlayerCount: ambiguous,
+    title: meta.title || String(event.title)
+  };
+}
+
+async function preparePairingsStaging(
+  ctx: ServerContext,
+  event: TableRow,
+  options?: { force?: boolean; fetchPageHtml?: boolean }
+): Promise<{
+  roundNumber: number;
+  pairingCount: number;
+  chunkTotal: number;
+  title: string;
+}> {
+  const externalEventId = String(event.externalEventId);
+  const division = String(event.division) || "masters";
+  const jsonUrl = standingsJsonUrl(externalEventId, division);
+
+  let pageHtml: string | null = null;
+  let htmlRound: number | null = null;
+
+  if (options?.fetchPageHtml !== false) {
+    pageHtml = await fetchText(standingsPageUrl(externalEventId, division));
+    htmlRound = parseCurrentRoundFromHtml(pageHtml);
+
+    if (htmlRound !== null) {
+      const titleFromHtml = parseEventTitleFromHtml(pageHtml);
+      ctx.db.events.update(event.id, {
+        currentRound: String(htmlRound),
+        lastRefreshAt: new Date().toISOString(),
+        ...(titleFromHtml ? { title: titleFromHtml } : {})
+      });
+    }
+  }
+
+  const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id);
+  const standingsRound = cached ? detectCurrentRoundFromPayload(String(cached.body)) : null;
+  let jsonBody = "";
+
+  if (
+    !options?.force &&
+    pairingsImportFresh(ctx, event.id) &&
+    cached &&
+    standingsRound !== null &&
+    countPairingsInRound(String(cached.body), standingsRound) > 0
+  ) {
+    jsonBody = String(cached.body);
+  } else {
+    jsonBody = await fetchText(jsonUrl);
+    replaceSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id, jsonBody);
+  }
+
+  const storedRound = Number.parseInt(String(event.currentRound), 10) || 0;
+  const standingsRoundFromBody = detectCurrentRoundFromPayload(jsonBody);
+  const roundNumber =
+    htmlRound !== null
+      ? Math.max(htmlRound, standingsRoundFromBody, storedRound)
+      : resolveCurrentRound(null, Math.max(standingsRoundFromBody, storedRound));
+
+  const parsedPairings = parsePairingsForRound(jsonBody, roundNumber);
+
+  if (parsedPairings.length === 0) {
+    throw new Error(`nenhuma partida encontrada para a rodada ${roundNumber}`);
+  }
+
+  const compactRows = parsedPairings.map((pairing) => compactPairing(pairing));
+  const chunkTotal = storePairingsStagingChunks(ctx, event.id, compactRows);
+  const title = (pageHtml ? parseEventTitleFromHtml(pageHtml) : "") || String(event.title);
+  const importedAt = new Date().toISOString();
+
+  writePairingsStagingMeta(ctx, event.id, {
+    roundNumber,
+    pairingCount: parsedPairings.length,
+    chunkTotal,
+    title,
+    importedAt
+  });
+
+  ctx.log.info("pairings staged for chunked import", {
+    externalEventId,
+    roundNumber,
+    pairingCount: parsedPairings.length,
+    chunkTotal
+  });
+
+  return {
+    roundNumber,
+    pairingCount: parsedPairings.length,
+    chunkTotal,
+    title
+  };
+}
+
+function commitPairingsStagingChunk(
+  ctx: ServerContext,
+  event: TableRow,
+  chunkIndex: number
+): {
+  inserted: number;
+  done: boolean;
+  roundNumber: number;
+  pairingCount: number;
+  unmatchedPlayerCount: number;
+  ambiguousPlayerCount: number;
+  title: string;
+} {
+  const meta = readPairingsStagingMeta(ctx, event.id);
+
+  if (!meta) {
+    throw new Error("pairings staging not prepared");
+  }
+
+  if (chunkIndex < 0 || chunkIndex >= meta.chunkTotal) {
+    throw new Error(`invalid pairings chunk index ${chunkIndex}`);
+  }
+
+  if (chunkIndex === 0) {
+    const existingPairings = ctx.db.pairings.where("eventId", event.id).all();
+    deleteAllRows(ctx, "pairings", existingPairings);
+  }
+
+  const compactRows = loadPairingsStagingChunk(ctx, event.id, chunkIndex);
+  const importedAt = meta.importedAt;
+
+  for (const compactRow of compactRows) {
+    insertPairingRow(ctx, event.id, meta.roundNumber, expandCompactPairing(compactRow), importedAt);
+  }
+
+  const done = chunkIndex === meta.chunkTotal - 1;
+
+  if (!done) {
+    return {
+      inserted: compactRows.length,
+      done: false,
+      roundNumber: meta.roundNumber,
+      pairingCount: meta.pairingCount,
+      unmatchedPlayerCount: 0,
+      ambiguousPlayerCount: 0,
+      title: meta.title
+    };
+  }
+
+  const finalized = finalizePairingsImport(ctx, event, meta);
+
+  return {
+    inserted: compactRows.length,
+    done: true,
+    ...finalized
+  };
+}
+
+async function importPairingsForEventChunked(
+  ctx: ServerContext,
+  event: TableRow,
+  options?: { force?: boolean; fetchPageHtml?: boolean }
+): Promise<{
+  roundNumber: number;
+  pairingCount: number;
+  unmatchedPlayerCount: number;
+  ambiguousPlayerCount: number;
+  title: string;
+}> {
+  const staged = await preparePairingsStaging(ctx, event, options);
+  let lastResult = {
+    roundNumber: staged.roundNumber,
+    pairingCount: 0,
+    unmatchedPlayerCount: 0,
+    ambiguousPlayerCount: 0,
+    title: staged.title
+  };
+
+  for (let chunkIndex = 0; chunkIndex < staged.chunkTotal; chunkIndex++) {
+    const committed = commitPairingsStagingChunk(ctx, event, chunkIndex);
+    if (committed.done) {
+      lastResult = {
+        roundNumber: committed.roundNumber,
+        pairingCount: committed.pairingCount,
+        unmatchedPlayerCount: committed.unmatchedPlayerCount,
+        ambiguousPlayerCount: committed.ambiguousPlayerCount,
+        title: committed.title
+      };
+    }
+  }
+
+  return lastResult;
 }
 
 function applyPairingsPayload(
@@ -763,6 +1093,11 @@ export default capsule({
       isActive: boolean().default(true)
     }),
     cpChunks: table({
+      chunkIndex: string(),
+      body: string()
+    }),
+    pairingsChunks: table({
+      eventId: string(),
       chunkIndex: string(),
       body: string()
     }),
@@ -943,12 +1278,7 @@ export default capsule({
 
         await syncCurrentRoundFromPokeData(serverCtx, eventRow);
 
-        const refreshed = await importPairingsForEvent(serverCtx, eventRow, {
-          force: true,
-          fetchPageHtml: true
-        });
-
-        return { eventId: duplicate.id, ...refreshed };
+        return { eventId: duplicate.id };
       }
 
       const created = serverCtx.db.events.insert({
@@ -969,12 +1299,93 @@ export default capsule({
 
       await syncCurrentRoundFromPokeData(serverCtx, created);
 
-      const refreshed = await importPairingsForEvent(serverCtx, created, {
-        force: true,
-        fetchPageHtml: true
+      return { eventId: created.id };
+    }),
+
+    preparePairingsImport: mutation(async (ctx, force?: boolean) => {
+      const serverCtx = ctx as ServerContext;
+      const event = getActiveEvent(serverCtx);
+
+      if (!event) {
+        throw new Error("no active event");
+      }
+
+      const externalEventId = String(event.externalEventId);
+      const startedAt = new Date().toISOString();
+
+      serverCtx.db.refreshRuns.insert({
+        eventId: event.id,
+        startedAt,
+        finishedAt: "",
+        status: "running",
+        roundNumber: String(event.currentRound),
+        pairingCount: "0",
+        unmatchedPlayerCount: "0",
+        ambiguousPlayerCount: "0",
+        message: "staging"
       });
 
-      return { eventId: created.id, ...refreshed };
+      trimRefreshRuns(serverCtx, event.id);
+      serverCtx.log.info("pairings import staging started", { externalEventId });
+
+      try {
+        await syncCurrentRoundFromPokeData(serverCtx, event);
+        const staged = await preparePairingsStaging(serverCtx, event, {
+          force: Boolean(force),
+          fetchPageHtml: true
+        });
+
+        return staged;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const run = getLatestRunningRefreshRun(serverCtx, event.id);
+
+        if (run) {
+          serverCtx.db.refreshRuns.update(run.id, {
+            finishedAt: new Date().toISOString(),
+            status: "error",
+            message
+          });
+        }
+
+        serverCtx.log.error("pairings import staging failed", { externalEventId, message });
+        throw error;
+      }
+    }),
+
+    commitPairingsChunk: mutation((ctx, chunkIndex: number) => {
+      const serverCtx = ctx as ServerContext;
+      const event = getActiveEvent(serverCtx);
+
+      if (!event) {
+        throw new Error("no active event");
+      }
+
+      const committed = commitPairingsStagingChunk(serverCtx, event, chunkIndex);
+      const run = getLatestRunningRefreshRun(serverCtx, event.id);
+
+      if (committed.done && run) {
+        const now = new Date().toISOString();
+        serverCtx.db.refreshRuns.update(run.id, {
+          finishedAt: now,
+          status: "success",
+          roundNumber: String(committed.roundNumber),
+          pairingCount: String(committed.pairingCount),
+          unmatchedPlayerCount: String(committed.unmatchedPlayerCount),
+          ambiguousPlayerCount: String(committed.ambiguousPlayerCount),
+          message: "ok"
+        });
+
+        trimRefreshRuns(serverCtx, event.id);
+
+        serverCtx.log.info("pairings import completed", {
+          externalEventId: String(event.externalEventId),
+          roundNumber: committed.roundNumber,
+          pairingCount: committed.pairingCount
+        });
+      }
+
+      return committed;
     }),
 
     syncCurrentRound: mutation(async (ctx) => {
@@ -1009,65 +1420,10 @@ export default capsule({
         throw new Error("no active event");
       }
 
-      const externalEventId = String(event.externalEventId);
-      const division = String(event.division) || "masters";
-      const startedAt = new Date().toISOString();
-
-      const run = serverCtx.db.refreshRuns.insert({
-        eventId: event.id,
-        startedAt,
-        finishedAt: "",
-        status: "running",
-        roundNumber: String(event.currentRound),
-        pairingCount: "0",
-        unmatchedPlayerCount: "0",
-        ambiguousPlayerCount: "0",
-        message: ""
+      return importPairingsForEventChunked(serverCtx, event, {
+        force: true,
+        fetchPageHtml: true
       });
-
-      serverCtx.log.info("pairings refresh started", { externalEventId, division });
-
-      try {
-        await syncCurrentRoundFromPokeData(serverCtx, event);
-        const result = await importPairingsForEvent(serverCtx, event, {
-          force: true,
-          fetchPageHtml: true
-        });
-        const now = new Date().toISOString();
-
-        serverCtx.db.refreshRuns.update(run.id, {
-          finishedAt: now,
-          status: "success",
-          roundNumber: String(result.roundNumber),
-          pairingCount: String(result.pairingCount),
-          unmatchedPlayerCount: String(result.unmatchedPlayerCount),
-          ambiguousPlayerCount: String(result.ambiguousPlayerCount),
-          message: "ok"
-        });
-
-        trimRefreshRuns(serverCtx, event.id);
-
-        serverCtx.log.info("pairings refresh completed", {
-          externalEventId,
-          roundNumber: result.roundNumber,
-          pairingCount: result.pairingCount,
-          unmatchedPlayerCount: result.unmatchedPlayerCount,
-          ambiguousPlayerCount: result.ambiguousPlayerCount
-        });
-
-        return result;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        serverCtx.db.refreshRuns.update(run.id, {
-          finishedAt: new Date().toISOString(),
-          status: "error",
-          message
-        });
-        trimRefreshRuns(serverCtx, event.id);
-
-        serverCtx.log.error("pairings refresh failed", { externalEventId, message });
-        throw error;
-      }
     }),
 
     savePlayerOverride: mutation(

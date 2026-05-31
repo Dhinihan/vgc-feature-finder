@@ -116,15 +116,27 @@ export function App() {
 
   const configureEvent = useMutation<[string, string, string], { eventId: string }>("configureEvent");
   const syncCurrentRound = useMutation<[], { roundNumber: number }>("syncCurrentRound");
-  const refreshPairings = useMutation<
-    [],
+  const preparePairingsImport = useMutation<
+    [boolean | undefined],
     {
+      roundNumber: number;
+      pairingCount: number;
+      chunkTotal: number;
+      title: string;
+    }
+  >("preparePairingsImport");
+  const commitPairingsChunk = useMutation<
+    [number],
+    {
+      inserted: number;
+      done: boolean;
       roundNumber: number;
       pairingCount: number;
       unmatchedPlayerCount: number;
       ambiguousPlayerCount: number;
+      title: string;
     }
-  >("refreshPairings");
+  >("commitPairingsChunk");
   const savePlayerOverride = useMutation<[string, string, string, string], void>("savePlayerOverride");
 
   const [eventInput, setEventInput] = useState("");
@@ -173,13 +185,55 @@ export function App() {
     return rows;
   }, [dashboard.rankedPairings, filterMode]);
 
+  async function importPairingsInChunks(force: boolean): Promise<{
+    roundNumber: number;
+    pairingCount: number;
+    unmatchedPlayerCount: number;
+    ambiguousPlayerCount: number;
+  }> {
+    const staged = await preparePairingsImport(force);
+    let result = {
+      roundNumber: staged.roundNumber,
+      pairingCount: staged.pairingCount,
+      unmatchedPlayerCount: 0,
+      ambiguousPlayerCount: 0
+    };
+
+    for (let chunkIndex = 0; chunkIndex < staged.chunkTotal; chunkIndex++) {
+      setStatusMessage(
+        `Importando partidas ${chunkIndex + 1}/${staged.chunkTotal} (rodada ${staged.roundNumber})...`
+      );
+      const committed = await commitPairingsChunk(chunkIndex);
+      if (committed.done) {
+        result = {
+          roundNumber: committed.roundNumber,
+          pairingCount: committed.pairingCount,
+          unmatchedPlayerCount: committed.unmatchedPlayerCount,
+          ambiguousPlayerCount: committed.ambiguousPlayerCount
+        };
+      }
+    }
+
+    return result;
+  }
+
   async function onConfigureEvent(event: Event) {
     event.preventDefault();
+    setIsRefreshing(true);
+    setStatusMessage("Configurando evento...");
+
     try {
       await configureEvent(eventInput.trim(), "", division);
-      setStatusMessage("Evento configurado.");
+      await syncCurrentRound().catch(() => undefined);
+      const result = await importPairingsInChunks(true);
+      const cpCount = cpMeta?.playerCount ?? 0;
+      setStatusMessage(
+        `Evento configurado. Rodada ${result.roundNumber}, ${result.pairingCount} partidas. CP no banco: ${formatNumber(cpCount)}.`
+      );
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : "Falha ao configurar evento.");
+    } finally {
+      setIsRefreshing(false);
     }
   }
 
@@ -193,7 +247,7 @@ export function App() {
 
     try {
       const roundSync = await syncCurrentRound();
-      const result = await refreshPairings();
+      const result = await importPairingsInChunks(true);
       const roundNumber = Math.max(roundSync.roundNumber, result.roundNumber);
       const cpCount = cpMeta?.playerCount ?? 0;
       setStatusMessage(
