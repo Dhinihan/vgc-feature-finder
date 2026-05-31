@@ -3,7 +3,8 @@ import { normalizePlayerName } from "./normalize-player-name";
 import {
   formatTournamentRecord,
   parseChampionshipPointsPayload,
-  parsePairingsPayload
+  parsePairingsPayload,
+  resolveCurrentRound
 } from "./parsing";
 import { rankPairings, scorePairing } from "./scoring";
 import type { ChampionshipPointsPlayer, Pairing, PlayerOverride } from "./domain";
@@ -144,6 +145,27 @@ export function runSmokeTests(): string[] {
       }
     }
   ]);
+
+  assert(resolveCurrentRound(9, 8) === 9, "html round ahead of json");
+  assert(resolveCurrentRound(8, 9) === 9, "json round ahead of html");
+  assert(resolveCurrentRound(null, 4) === 4, "json-only round");
+
+  const liveRoundPayload = JSON.stringify([
+    {
+      name: "Top [US]",
+      rounds: {
+        "8": { name: "Rival [US]", result: "W", table: 1 },
+        "9": { name: "Other [US]", result: null, table: 2 }
+      }
+    },
+    {
+      name: "Rival [US]",
+      rounds: {
+        "8": { name: "Top [US]", result: "L", table: 1 }
+      }
+    }
+  ]);
+  assert(parsePairingsPayload(liveRoundPayload).currentRound === 9, "pending round 9 detected");
 
   const parsedRound = parsePairingsPayload(pairingsPayload);
   assert(parsedRound.pairings.length === 1, "pairings dedupe");

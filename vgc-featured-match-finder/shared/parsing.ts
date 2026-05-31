@@ -228,6 +228,19 @@ export function parseCurrentRoundFromHtml(html: string): number | null {
   return Number.parseInt(match[1], 10);
 }
 
+/** Prefer the most up-to-date round when PokéData HTML and JSON disagree. */
+export function resolveCurrentRound(htmlRound: number | null, standingsRound: number): number {
+  if (htmlRound === null) {
+    return standingsRound;
+  }
+
+  if (standingsRound <= 0) {
+    return htmlRound;
+  }
+
+  return Math.max(htmlRound, standingsRound);
+}
+
 export function formatTournamentRecord(record: unknown): string | null {
   if (!record || typeof record !== "object") {
     return null;
@@ -283,6 +296,7 @@ function lookupTournamentRecord(
 
 function detectCurrentRound(standings: Array<Record<string, unknown>>): number {
   let maxRound = 0;
+  let highestPendingRound = 0;
 
   for (const player of standings) {
     const rounds = player.rounds;
@@ -290,15 +304,25 @@ function detectCurrentRound(standings: Array<Record<string, unknown>>): number {
       continue;
     }
 
-    for (const key of Object.keys(rounds as Record<string, unknown>)) {
+    for (const [key, roundData] of Object.entries(
+      rounds as Record<string, { result?: string | null }>
+    )) {
       const roundNumber = Number.parseInt(key, 10);
-      if (!Number.isNaN(roundNumber) && roundNumber > maxRound) {
+      if (Number.isNaN(roundNumber)) {
+        continue;
+      }
+
+      if (roundNumber > maxRound) {
         maxRound = roundNumber;
+      }
+
+      if (isPendingResult(roundData?.result) && roundNumber > highestPendingRound) {
+        highestPendingRound = roundNumber;
       }
     }
   }
 
-  return maxRound;
+  return highestPendingRound > 0 ? highestPendingRound : maxRound;
 }
 
 function extractPairingsFromStandings(
