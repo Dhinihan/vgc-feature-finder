@@ -192,11 +192,9 @@ async function main() {
     }
 
     if (report.recordBadgesAfterConfigure < 4) {
-      if (report.recordBadgesAfterConfigure < 4) {
-        report.errors.push(
-          `expected tournament record badges after configure, got ${report.recordBadgesAfterConfigure}`
-        );
-      }
+      report.errors.push(
+        `expected tournament record badges after configure, got ${report.recordBadgesAfterConfigure}`
+      );
     }
 
     const bodyAfterConfigure = await page.locator("body").innerText();

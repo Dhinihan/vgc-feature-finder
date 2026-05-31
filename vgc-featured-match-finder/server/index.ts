@@ -565,8 +565,9 @@ function buildEventDashboard(
   };
 }
 
-/** Lakebed caps each outbound fetch body at 1 MiB; PokéData standings JSON is larger. */
-const LAKEBED_MAX_FETCH_BYTES = 1_000_000;
+/** Lakebed caps each outbound fetch body at 1 MiB; row storage is ~64 KiB per chunk. */
+const LAKEBED_MAX_FETCH_BYTES = 50_000;
+const LAKEBED_MAX_ROW_BYTES = 50_000;
 
 async function fetchText(url: string, init?: RequestInit): Promise<string> {
   const response = await fetch(url, init);
@@ -594,16 +595,45 @@ function parseContentRangeTotal(contentRange: string | null): number | null {
 
 type PairingsJsonMeta = {
   totalBytes: number;
-  sliceCount: number;
+  fetchSliceCount: number;
+  rowSliceCount: number;
   jsonUrl: string;
 };
 
-function pairingsJsonSliceKey(sliceIndex: number): string {
-  return `${PAIRINGS_JSON_SLICE_PREFIX}${sliceIndex}`;
+function pairingsJsonFetchSliceKey(fetchSliceIndex: number): string {
+  return `${PAIRINGS_JSON_SLICE_PREFIX}fetch-${fetchSliceIndex}`;
+}
+
+function pairingsJsonRowSliceKey(rowSliceIndex: number): string {
+  return `${PAIRINGS_JSON_SLICE_PREFIX}row-${rowSliceIndex}`;
 }
 
 function isPairingsJsonChunkIndex(chunkIndex: string): boolean {
-  return chunkIndex === PAIRINGS_JSON_META || chunkIndex.startsWith(PAIRINGS_JSON_SLICE_PREFIX);
+  return (
+    chunkIndex === PAIRINGS_JSON_META ||
+    chunkIndex.startsWith(PAIRINGS_JSON_SLICE_PREFIX)
+  );
+}
+
+function storeJsonBodyInRowSlices(ctx: ServerContext, eventId: string, body: string): number {
+  const existing = ctx.db.pairingsChunks
+    .where("eventId", eventId)
+    .all()
+    .filter((row) => String(row.chunkIndex).startsWith(`${PAIRINGS_JSON_SLICE_PREFIX}row-`));
+  deleteAllRows(ctx, "pairingsChunks", existing);
+
+  let rowSliceCount = 0;
+  for (let start = 0; start < body.length; start += LAKEBED_MAX_ROW_BYTES) {
+    const part = body.slice(start, start + LAKEBED_MAX_ROW_BYTES);
+    ctx.db.pairingsChunks.insert({
+      eventId,
+      chunkIndex: pairingsJsonRowSliceKey(rowSliceCount),
+      body: part
+    });
+    rowSliceCount++;
+  }
+
+  return rowSliceCount;
 }
 
 function isPairingsStagingChunkIndex(chunkIndex: string): boolean {
@@ -612,7 +642,7 @@ function isPairingsStagingChunkIndex(chunkIndex: string): boolean {
 
 async function probePairingsJsonSize(
   url: string
-): Promise<{ totalBytes: number; sliceCount: number; singleFetch: boolean }> {
+): Promise<{ totalBytes: number; fetchSliceCount: number; singleFetch: boolean }> {
   const probe = await fetch(url, { headers: { Range: "bytes=0-0" } });
 
   if (probe.status === 206) {
@@ -621,18 +651,18 @@ async function probePairingsJsonSize(
     if (totalBytes !== null && totalBytes > LAKEBED_MAX_FETCH_BYTES) {
       return {
         totalBytes,
-        sliceCount: Math.ceil(totalBytes / LAKEBED_MAX_FETCH_BYTES),
+        fetchSliceCount: Math.ceil(totalBytes / LAKEBED_MAX_FETCH_BYTES),
         singleFetch: false
       };
     }
 
     if (totalBytes !== null) {
-      return { totalBytes, sliceCount: 1, singleFetch: true };
+      return { totalBytes, fetchSliceCount: 1, singleFetch: true };
     }
   }
 
   const body = await fetchText(url);
-  return { totalBytes: body.length, sliceCount: 1, singleFetch: true };
+  return { totalBytes: body.length, fetchSliceCount: 1, singleFetch: true };
 }
 
 async function fetchPairingsJsonSliceBody(
@@ -696,14 +726,14 @@ function assemblePairingsJsonFromSlices(ctx: ServerContext, eventId: string): st
   }
 
   const parts: string[] = [];
-  for (let index = 0; index < meta.sliceCount; index++) {
+  for (let index = 0; index < meta.rowSliceCount; index++) {
     const row = ctx.db.pairingsChunks
       .where("eventId", eventId)
       .all()
-      .find((item) => String(item.chunkIndex) === pairingsJsonSliceKey(index));
+      .find((item) => String(item.chunkIndex) === pairingsJsonRowSliceKey(index));
 
     if (!row) {
-      throw new Error(`missing pairings JSON slice ${index}`);
+      throw new Error(`missing pairings JSON row slice ${index}`);
     }
 
     parts.push(String(row.body));
@@ -732,51 +762,86 @@ async function fetchPairingsJsonSlice(
     const probed = await probePairingsJsonSize(jsonUrl);
     meta = {
       totalBytes: probed.totalBytes,
-      sliceCount: probed.sliceCount,
+      fetchSliceCount: probed.fetchSliceCount,
+      rowSliceCount: 0,
       jsonUrl
     };
     writePairingsJsonMeta(ctx, event.id, meta);
   }
 
-  if (sliceIndex < 0 || sliceIndex >= meta.sliceCount) {
-    throw new Error(`invalid pairings JSON slice index ${sliceIndex}`);
+  if (sliceIndex < 0 || sliceIndex >= meta.fetchSliceCount) {
+    throw new Error(`invalid pairings JSON fetch slice index ${sliceIndex}`);
   }
 
-  const existing = ctx.db.pairingsChunks
+  const existingFetch = ctx.db.pairingsChunks
     .where("eventId", event.id)
     .all()
-    .find((row) => String(row.chunkIndex) === pairingsJsonSliceKey(sliceIndex));
+    .find((row) => String(row.chunkIndex) === pairingsJsonFetchSliceKey(sliceIndex));
 
-  if (!existing || options?.force) {
-    if (existing) {
-      deleteAllRows(ctx, "pairingsChunks", [existing]);
+  if (!existingFetch || options?.force) {
+    if (existingFetch) {
+      deleteAllRows(ctx, "pairingsChunks", [existingFetch]);
     }
 
     const body = await fetchPairingsJsonSliceBody(
       jsonUrl,
       sliceIndex,
       meta.totalBytes,
-      meta.sliceCount === 1 && meta.totalBytes <= LAKEBED_MAX_FETCH_BYTES
+      meta.fetchSliceCount === 1 && meta.totalBytes <= LAKEBED_MAX_FETCH_BYTES
     );
 
     ctx.db.pairingsChunks.insert({
       eventId: event.id,
-      chunkIndex: pairingsJsonSliceKey(sliceIndex),
+      chunkIndex: pairingsJsonFetchSliceKey(sliceIndex),
       body
     });
 
-    ctx.log.info("pairings JSON slice fetched", {
+    ctx.log.info("pairings JSON fetch slice stored", {
       externalEventId,
       sliceIndex,
-      sliceTotal: meta.sliceCount,
+      fetchSliceTotal: meta.fetchSliceCount,
       byteLength: body.length
+    });
+  }
+
+  const isLastFetchSlice = sliceIndex === meta.fetchSliceCount - 1;
+  if (isLastFetchSlice) {
+    const fetchParts: string[] = [];
+    for (let index = 0; index < meta.fetchSliceCount; index++) {
+      const row = ctx.db.pairingsChunks
+        .where("eventId", event.id)
+        .all()
+        .find((item) => String(item.chunkIndex) === pairingsJsonFetchSliceKey(index));
+
+      if (!row) {
+        throw new Error(`missing pairings JSON fetch slice ${index}`);
+      }
+
+      fetchParts.push(String(row.body));
+    }
+
+    const assembled = fetchParts.join("");
+    const rowSliceCount = storeJsonBodyInRowSlices(ctx, event.id, assembled);
+    meta = { ...meta, rowSliceCount, totalBytes: assembled.length };
+    writePairingsJsonMeta(ctx, event.id, meta);
+
+    const fetchRows = ctx.db.pairingsChunks
+      .where("eventId", event.id)
+      .all()
+      .filter((row) => String(row.chunkIndex).startsWith(`${PAIRINGS_JSON_SLICE_PREFIX}fetch-`));
+    deleteAllRows(ctx, "pairingsChunks", fetchRows);
+
+    ctx.log.info("pairings JSON re-chunked for row limit", {
+      externalEventId,
+      rowSliceCount,
+      totalBytes: assembled.length
     });
   }
 
   return {
     sliceIndex,
-    sliceTotal: meta.sliceCount,
-    done: sliceIndex === meta.sliceCount - 1
+    sliceTotal: meta.fetchSliceCount,
+    done: isLastFetchSlice
   };
 }
 
@@ -788,7 +853,7 @@ async function fetchTextLarge(url: string): Promise<string> {
   }
 
   const parts: string[] = [];
-  for (let index = 0; index < probed.sliceCount; index++) {
+  for (let index = 0; index < probed.fetchSliceCount; index++) {
     parts.push(await fetchPairingsJsonSliceBody(url, index, probed.totalBytes, false));
   }
 
