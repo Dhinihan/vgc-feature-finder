@@ -1,6 +1,8 @@
 import { matchPlayerToChampionshipPoints } from "./match-player";
 import { normalizePlayerName } from "./normalize-player-name";
 import {
+  detectCurrentRoundFromRawJson,
+  extractPairingsForRoundRaw,
   formatTournamentRecord,
   parseChampionshipPointsPayload,
   parsePairingsPayload,
@@ -153,6 +155,7 @@ export function runSmokeTests(): string[] {
   const liveRoundPayload = JSON.stringify([
     {
       name: "Top [US]",
+      record: { wins: 8, losses: 0, ties: 0 },
       rounds: {
         "8": { name: "Rival [US]", result: "W", table: 1 },
         "9": { name: "Other [US]", result: null, table: 2 }
@@ -160,12 +163,15 @@ export function runSmokeTests(): string[] {
     },
     {
       name: "Rival [US]",
+      record: { wins: 7, losses: 1, ties: 0 },
       rounds: {
         "8": { name: "Top [US]", result: "L", table: 1 }
       }
     }
   ]);
   assert(parsePairingsPayload(liveRoundPayload).currentRound === 9, "pending round 9 detected");
+  assert(detectCurrentRoundFromRawJson(liveRoundPayload) === 9, "raw pending round 9");
+  assert(extractPairingsForRoundRaw(liveRoundPayload, 8).length === 1, "raw pairings extraction");
 
   const parsedRound = parsePairingsPayload(pairingsPayload);
   assert(parsedRound.pairings.length === 1, "pairings dedupe");
