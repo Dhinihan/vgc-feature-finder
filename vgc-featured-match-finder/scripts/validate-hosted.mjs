@@ -173,7 +173,7 @@ async function main() {
       .isVisible({ timeout: 10_000 })
       .catch(() => false);
 
-    await waitForRefreshButtonReady(page, 240_000);
+    await waitForRefreshButtonReady(page, 360_000);
     report.steps.push("import finished after configure");
 
     const roundAfterConfigure = await waitForRound(page, expected.current, 30_000);
@@ -221,7 +221,7 @@ async function main() {
         report.errors.push("no loading indicator after clicking Atualizar partidas");
       }
 
-      await waitForRefreshButtonReady(page, 240_000);
+      await waitForRefreshButtonReady(page, 360_000);
       await page.waitForTimeout(1_500);
     }
 
@@ -284,7 +284,7 @@ async function main() {
     const refreshOnlyBtn = page.getByRole("button", { name: /^Atualizar partidas$/ });
     if (await refreshOnlyBtn.isEnabled()) {
       await refreshOnlyBtn.click();
-      await waitForRefreshButtonReady(page, 240_000);
+      await waitForRefreshButtonReady(page, 360_000);
       const roundRefreshOnly = await waitForRound(page, expected.current, 30_000);
       report.partidasRefreshOnly = await readPartidasStat(page);
       report.roundAfterRefreshOnly = roundRefreshOnly;

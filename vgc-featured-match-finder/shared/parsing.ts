@@ -214,7 +214,7 @@ export function detectCurrentRoundFromRawJson(payload: string): number {
 const STANDING_PLAYER_NAME_PATTERN =
   /"name"\s*:\s*"([^"]+ \[[A-Z]{2,3}\])"\s*,\s*"(?:placing|record)"/g;
 
-function buildTournamentRecordIndexRaw(payload: string): Map<string, string> {
+export function buildTournamentRecordIndexRaw(payload: string): Map<string, string> {
   const index = new Map<string, string>();
   const playerPattern =
     /"name"\s*:\s*"([^"]+ \[[A-Z]{2,3}\])"\s*,\s*(?:"placing"\s*:\s*\d+\s*,\s*)?"record"\s*:\s*\{\s*"wins"\s*:\s*(\d+)\s*,\s*"losses"\s*:\s*(\d+)\s*,\s*"ties"\s*:\s*(\d+)/g;
@@ -235,13 +235,64 @@ function buildTournamentRecordIndexRaw(payload: string): Map<string, string> {
   return index;
 }
 
+export function mergeTournamentRecordIndexes(
+  left: Map<string, string>,
+  right: Map<string, string>
+): Map<string, string> {
+  const merged = new Map(left);
+  for (const [key, value] of right) {
+    merged.set(key, value);
+  }
+  return merged;
+}
+
+export function mergeExtractedPairings(
+  existing: ParsedTournamentRound["pairings"],
+  incoming: ParsedTournamentRound["pairings"],
+  seen: Set<string>,
+  roundNumber: number
+): ParsedTournamentRound["pairings"] {
+  for (const pairing of incoming) {
+    const playerSide = normalizePlayerName(pairing.playerA.displayName);
+    const roundKey = String(roundNumber);
+
+    if (pairing.isBye) {
+      const byeKey = `bye:${playerSide}:${roundKey}`;
+      if (seen.has(byeKey)) {
+        continue;
+      }
+      seen.add(byeKey);
+      existing.push(pairing);
+      continue;
+    }
+
+    if (!pairing.playerB) {
+      continue;
+    }
+
+    const opponentSide = normalizePlayerName(pairing.playerB.displayName);
+    const names = [playerSide, opponentSide].sort();
+    const dedupeKey = `${pairing.tableNumber ?? 0}:${names[0]}:${names[1]}`;
+
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+
+    seen.add(dedupeKey);
+    existing.push(pairing);
+  }
+
+  return existing.sort((a, b) => (a.tableNumber ?? 99999) - (b.tableNumber ?? 99999));
+}
+
 export function extractPairingsForRoundRaw(
   payload: string,
-  roundNumber: number
+  roundNumber: number,
+  recordIndex?: Map<string, string>
 ): ParsedTournamentRound["pairings"] {
   const seen = new Set<string>();
   const pairings: ParsedTournamentRound["pairings"] = [];
-  const recordIndex = buildTournamentRecordIndexRaw(payload);
+  const index = recordIndex ?? buildTournamentRecordIndexRaw(payload);
   const roundPattern = new RegExp(
     `"${roundNumber}"\\s*:\\s*\\{\\s*"name"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"\\s*,\\s*"result"\\s*:\\s*(null|"[^"]*")\\s*,\\s*"table"\\s*:\\s*"?\\s*([^"\\}]*)`
   );
@@ -277,7 +328,7 @@ export function extractPairingsForRoundRaw(
         tableNumber,
         playerA: {
           ...playerLabel,
-          tournamentRecord: lookupTournamentRecord(recordIndex, playerLabel)
+          tournamentRecord: lookupTournamentRecord(index, playerLabel)
         },
         playerB: null,
         result: result ?? "W",
@@ -302,11 +353,11 @@ export function extractPairingsForRoundRaw(
       tableNumber,
       playerA: {
         ...playerLabel,
-        tournamentRecord: lookupTournamentRecord(recordIndex, playerLabel)
+        tournamentRecord: lookupTournamentRecord(index, playerLabel)
       },
       playerB: {
         ...opponentLabel,
-        tournamentRecord: lookupTournamentRecord(recordIndex, opponentLabel)
+        tournamentRecord: lookupTournamentRecord(index, opponentLabel)
       },
       result: formatMatchResult(result),
       isPending: isPendingResult(result),
