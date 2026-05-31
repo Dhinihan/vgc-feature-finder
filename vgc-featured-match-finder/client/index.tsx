@@ -122,15 +122,23 @@ export function App() {
     [number, boolean | undefined],
     { sliceIndex: number; sliceTotal: number; done: boolean }
   >("fetchPairingsJsonSlice");
-  const preparePairingsImport = useMutation<
-    [boolean | undefined],
+  const preparePairingsImportBegin = useMutation<
+    [],
+    { targetRound: number; parseBatchTotal: number }
+  >("preparePairingsImportBegin");
+  const preparePairingsImportParseBatch = useMutation<
+    [number],
+    { batchIndex: number; parseBatchTotal: number; done: boolean }
+  >("preparePairingsImportParseBatch");
+  const preparePairingsImportFinalize = useMutation<
+    [],
     {
       roundNumber: number;
       pairingCount: number;
       chunkTotal: number;
       title: string;
     }
-  >("preparePairingsImport");
+  >("preparePairingsImportFinalize");
   const commitPairingsChunk = useMutation<
     [number],
     {
@@ -209,7 +217,14 @@ export function App() {
     }
 
     setStatusMessage("Preparando partidas para importação...");
-    const staged = await preparePairingsImport(force);
+    const begun = await preparePairingsImportBegin();
+    for (let batchIndex = 0; batchIndex < begun.parseBatchTotal; batchIndex++) {
+      setStatusMessage(
+        `Analisando standings ${batchIndex + 1}/${begun.parseBatchTotal} (rodada ${begun.targetRound})...`
+      );
+      await preparePairingsImportParseBatch(batchIndex);
+    }
+    const staged = await preparePairingsImportFinalize();
     let result = {
       roundNumber: staged.roundNumber,
       pairingCount: staged.pairingCount,

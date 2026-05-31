@@ -33,8 +33,12 @@ import {
   parseCurrentRoundFromHtml,
   resolveCurrentRound,
   parseEventTitleFromHtml,
+  buildTournamentRecordIndexRaw,
   countPairingsInRound,
   detectCurrentRoundFromPayload,
+  extractPairingsForRoundRaw,
+  mergeExtractedPairings,
+  mergeTournamentRecordIndexes,
   parsePairingsForRound,
   parsePlayerLabel
 } from "../shared/parsing";
@@ -57,6 +61,9 @@ const REFRESH_RUN_LIMIT = 20;
 const PAIRINGS_STAGING_META = "meta";
 const PAIRINGS_JSON_META = "json-meta";
 const PAIRINGS_JSON_SLICE_PREFIX = "json-";
+const PAIRINGS_PREP_STATE = "prep-state";
+const PAIRINGS_ROW_SLICE_PARSE_BATCH = 4;
+const PAIRINGS_ROW_SLICE_OVERLAP_BYTES = 12_000;
 const PAIRINGS_ROWS_PER_COMMIT = 6;
 const WILDCARD_COUNTRY = "*";
 const MAX_PERSISTED_PAYLOAD_BYTES = 60_000;
@@ -597,12 +604,9 @@ type PairingsJsonMeta = {
   totalBytes: number;
   fetchSliceCount: number;
   rowSliceCount: number;
+  fetchedThrough: number;
   jsonUrl: string;
 };
-
-function pairingsJsonFetchSliceKey(fetchSliceIndex: number): string {
-  return `${PAIRINGS_JSON_SLICE_PREFIX}fetch-${fetchSliceIndex}`;
-}
 
 function pairingsJsonRowSliceKey(rowSliceIndex: number): string {
   return `${PAIRINGS_JSON_SLICE_PREFIX}row-${rowSliceIndex}`;
@@ -615,25 +619,161 @@ function isPairingsJsonChunkIndex(chunkIndex: string): boolean {
   );
 }
 
-function storeJsonBodyInRowSlices(ctx: ServerContext, eventId: string, body: string): number {
-  const existing = ctx.db.pairingsChunks
+function countPairingsJsonRowSlices(ctx: ServerContext, eventId: string): number {
+  return ctx.db.pairingsChunks
     .where("eventId", eventId)
     .all()
-    .filter((row) => String(row.chunkIndex).startsWith(`${PAIRINGS_JSON_SLICE_PREFIX}row-`));
-  deleteAllRows(ctx, "pairingsChunks", existing);
+    .filter((row) => String(row.chunkIndex).startsWith(`${PAIRINGS_JSON_SLICE_PREFIX}row-`))
+    .length;
+}
 
-  let rowSliceCount = 0;
-  for (let start = 0; start < body.length; start += LAKEBED_MAX_ROW_BYTES) {
-    const part = body.slice(start, start + LAKEBED_MAX_ROW_BYTES);
-    ctx.db.pairingsChunks.insert({
-      eventId,
-      chunkIndex: pairingsJsonRowSliceKey(rowSliceCount),
-      body: part
-    });
-    rowSliceCount++;
+function readPairingsJsonRowSlice(ctx: ServerContext, eventId: string, rowSliceIndex: number): string {
+  const row = ctx.db.pairingsChunks
+    .where("eventId", eventId)
+    .all()
+    .find((item) => String(item.chunkIndex) === pairingsJsonRowSliceKey(rowSliceIndex));
+
+  if (!row) {
+    throw new Error(`missing pairings JSON row slice ${rowSliceIndex}`);
   }
 
-  return rowSliceCount;
+  return String(row.body);
+}
+
+function appendPairingsJsonToRowSlices(ctx: ServerContext, eventId: string, chunk: string): number {
+  const rowRows = ctx.db.pairingsChunks
+    .where("eventId", eventId)
+    .all()
+    .filter((row) => String(row.chunkIndex).startsWith(`${PAIRINGS_JSON_SLICE_PREFIX}row-`))
+    .sort((left, right) => {
+      const leftIndex = Number.parseInt(String(left.chunkIndex).split("-").pop() ?? "0", 10);
+      const rightIndex = Number.parseInt(String(right.chunkIndex).split("-").pop() ?? "0", 10);
+      return leftIndex - rightIndex;
+    });
+
+  let lastRow = rowRows.at(-1) ?? null;
+  let remaining = chunk;
+
+  while (remaining.length > 0) {
+    const lastBody = lastRow ? String(lastRow.body) : "";
+    const spaceInLastRow = LAKEBED_MAX_ROW_BYTES - lastBody.length;
+
+    if (spaceInLastRow > 0) {
+      const take = remaining.slice(0, spaceInLastRow);
+      const updatedBody = lastBody + take;
+      remaining = remaining.slice(take.length);
+
+      if (lastRow) {
+        ctx.db.pairingsChunks.update(lastRow.id, { body: updatedBody });
+      } else {
+        lastRow = ctx.db.pairingsChunks.insert({
+          eventId,
+          chunkIndex: pairingsJsonRowSliceKey(0),
+          body: updatedBody
+        });
+      }
+    }
+
+    if (remaining.length === 0) {
+      break;
+    }
+
+    const nextIndex = lastRow
+      ? Number.parseInt(String(lastRow.chunkIndex).split("-").pop() ?? "0", 10) + 1
+      : 0;
+    const part = remaining.slice(0, LAKEBED_MAX_ROW_BYTES);
+    remaining = remaining.slice(part.length);
+
+    lastRow = ctx.db.pairingsChunks.insert({
+      eventId,
+      chunkIndex: pairingsJsonRowSliceKey(nextIndex),
+      body: part
+    });
+  }
+
+  return countPairingsJsonRowSlices(ctx, eventId);
+}
+
+type PairingsPrepState = {
+  targetRound: number;
+  recordIndex: Record<string, string>;
+  seenKeys: string[];
+  pairings: ParsedTournamentRound["pairings"];
+};
+
+function clearPairingsPrepState(ctx: ServerContext, eventId: string): void {
+  const rows = ctx.db.pairingsChunks
+    .where("eventId", eventId)
+    .all()
+    .filter((row) => String(row.chunkIndex) === PAIRINGS_PREP_STATE);
+  deleteAllRows(ctx, "pairingsChunks", rows);
+}
+
+function readPairingsPrepState(ctx: ServerContext, eventId: string): PairingsPrepState | null {
+  const row = ctx.db.pairingsChunks
+    .where("eventId", eventId)
+    .all()
+    .find((item) => String(item.chunkIndex) === PAIRINGS_PREP_STATE);
+
+  if (!row) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(String(row.body)) as PairingsPrepState;
+  } catch {
+    return null;
+  }
+}
+
+function writePairingsPrepState(ctx: ServerContext, eventId: string, state: PairingsPrepState): void {
+  clearPairingsPrepState(ctx, eventId);
+  ctx.db.pairingsChunks.insert({
+    eventId,
+    chunkIndex: PAIRINGS_PREP_STATE,
+    body: JSON.stringify(state)
+  });
+}
+
+function parsePairingsPrepBatch(
+  ctx: ServerContext,
+  eventId: string,
+  targetRound: number,
+  rowSliceStart: number,
+  rowSliceEnd: number,
+  state: PairingsPrepState
+): PairingsPrepState {
+  let recordIndex = new Map(Object.entries(state.recordIndex));
+  const seen = new Set(state.seenKeys);
+  let pairings = [...state.pairings];
+  let partial = "";
+
+  for (let index = rowSliceStart; index < rowSliceEnd; index++) {
+    partial += readPairingsJsonRowSlice(ctx, eventId, index);
+  }
+
+  recordIndex = mergeTournamentRecordIndexes(
+    recordIndex,
+    buildTournamentRecordIndexRaw(partial)
+  );
+
+  let scanPayload = partial;
+  if (rowSliceEnd < (readPairingsJsonMeta(ctx, eventId)?.rowSliceCount ?? rowSliceEnd)) {
+    scanPayload += readPairingsJsonRowSlice(ctx, eventId, rowSliceEnd).slice(
+      0,
+      PAIRINGS_ROW_SLICE_OVERLAP_BYTES
+    );
+  }
+
+  const batchPairings = extractPairingsForRoundRaw(scanPayload, targetRound, recordIndex);
+  pairings = mergeExtractedPairings(pairings, batchPairings, seen, targetRound);
+
+  return {
+    targetRound,
+    recordIndex: Object.fromEntries(recordIndex.entries()),
+    seenKeys: [...seen],
+    pairings
+  };
 }
 
 function isPairingsStagingChunkIndex(chunkIndex: string): boolean {
@@ -684,7 +824,11 @@ function clearPairingsJsonSlices(ctx: ServerContext, eventId: string): void {
   const rows = ctx.db.pairingsChunks
     .where("eventId", eventId)
     .all()
-    .filter((row) => isPairingsJsonChunkIndex(String(row.chunkIndex)));
+    .filter(
+      (row) =>
+        isPairingsJsonChunkIndex(String(row.chunkIndex)) ||
+        String(row.chunkIndex) === PAIRINGS_PREP_STATE
+    );
   deleteAllRows(ctx, "pairingsChunks", rows);
 }
 
@@ -764,6 +908,7 @@ async function fetchPairingsJsonSlice(
       totalBytes: probed.totalBytes,
       fetchSliceCount: probed.fetchSliceCount,
       rowSliceCount: 0,
+      fetchedThrough: -1,
       jsonUrl
     };
     writePairingsJsonMeta(ctx, event.id, meta);
@@ -773,70 +918,39 @@ async function fetchPairingsJsonSlice(
     throw new Error(`invalid pairings JSON fetch slice index ${sliceIndex}`);
   }
 
-  const existingFetch = ctx.db.pairingsChunks
-    .where("eventId", event.id)
-    .all()
-    .find((row) => String(row.chunkIndex) === pairingsJsonFetchSliceKey(sliceIndex));
-
-  if (!existingFetch || options?.force) {
-    if (existingFetch) {
-      deleteAllRows(ctx, "pairingsChunks", [existingFetch]);
-    }
-
-    const body = await fetchPairingsJsonSliceBody(
-      jsonUrl,
+  if (sliceIndex <= meta.fetchedThrough && !options?.force) {
+    return {
       sliceIndex,
-      meta.totalBytes,
-      meta.fetchSliceCount === 1 && meta.totalBytes <= LAKEBED_MAX_FETCH_BYTES
-    );
-
-    ctx.db.pairingsChunks.insert({
-      eventId: event.id,
-      chunkIndex: pairingsJsonFetchSliceKey(sliceIndex),
-      body
-    });
-
-    ctx.log.info("pairings JSON fetch slice stored", {
-      externalEventId,
-      sliceIndex,
-      fetchSliceTotal: meta.fetchSliceCount,
-      byteLength: body.length
-    });
+      sliceTotal: meta.fetchSliceCount,
+      done: sliceIndex === meta.fetchSliceCount - 1
+    };
   }
+
+  const body = await fetchPairingsJsonSliceBody(
+    jsonUrl,
+    sliceIndex,
+    meta.totalBytes,
+    meta.fetchSliceCount === 1 && meta.totalBytes <= LAKEBED_MAX_FETCH_BYTES
+  );
+
+  const rowSliceCount = appendPairingsJsonToRowSlices(ctx, event.id, body);
+  meta = {
+    ...meta,
+    rowSliceCount,
+    fetchedThrough: sliceIndex,
+    totalBytes: meta.totalBytes || body.length
+  };
+  writePairingsJsonMeta(ctx, event.id, meta);
+
+  ctx.log.info("pairings JSON fetch slice appended", {
+    externalEventId,
+    sliceIndex,
+    fetchSliceTotal: meta.fetchSliceCount,
+    byteLength: body.length,
+    rowSliceCount
+  });
 
   const isLastFetchSlice = sliceIndex === meta.fetchSliceCount - 1;
-  if (isLastFetchSlice) {
-    const fetchParts: string[] = [];
-    for (let index = 0; index < meta.fetchSliceCount; index++) {
-      const row = ctx.db.pairingsChunks
-        .where("eventId", event.id)
-        .all()
-        .find((item) => String(item.chunkIndex) === pairingsJsonFetchSliceKey(index));
-
-      if (!row) {
-        throw new Error(`missing pairings JSON fetch slice ${index}`);
-      }
-
-      fetchParts.push(String(row.body));
-    }
-
-    const assembled = fetchParts.join("");
-    const rowSliceCount = storeJsonBodyInRowSlices(ctx, event.id, assembled);
-    meta = { ...meta, rowSliceCount, totalBytes: assembled.length };
-    writePairingsJsonMeta(ctx, event.id, meta);
-
-    const fetchRows = ctx.db.pairingsChunks
-      .where("eventId", event.id)
-      .all()
-      .filter((row) => String(row.chunkIndex).startsWith(`${PAIRINGS_JSON_SLICE_PREFIX}fetch-`));
-    deleteAllRows(ctx, "pairingsChunks", fetchRows);
-
-    ctx.log.info("pairings JSON re-chunked for row limit", {
-      externalEventId,
-      rowSliceCount,
-      totalBytes: assembled.length
-    });
-  }
 
   return {
     sliceIndex,
@@ -1117,6 +1231,159 @@ function finalizePairingsImport(
   };
 }
 
+function resolvePairingsTargetRound(
+  ctx: ServerContext,
+  event: TableRow,
+  htmlRound: number | null,
+  jsonBody: string
+): number {
+  const storedRound = parseEventRound(String(event.currentRound));
+  const standingsRoundFromBody = detectCurrentRoundFromPayload(jsonBody);
+
+  return htmlRound !== null
+    ? Math.max(htmlRound, standingsRoundFromBody, storedRound)
+    : resolveCurrentRound(null, Math.max(standingsRoundFromBody, storedRound));
+}
+
+function beginPreparePairingsFromJsonSlices(
+  ctx: ServerContext,
+  event: TableRow
+): { targetRound: number; parseBatchTotal: number } {
+  const jsonMeta = readPairingsJsonMeta(ctx, event.id);
+
+  if (!jsonMeta || jsonMeta.rowSliceCount < 1) {
+    throw new Error("pairings JSON slices not fetched");
+  }
+
+  const targetRound = parseEventRound(
+    String(getActiveEvent(ctx)?.currentRound ?? event.currentRound)
+  );
+
+  if (targetRound < 1) {
+    throw new Error("current round is unknown; sync round before importing pairings");
+  }
+
+  clearPairingsStagingOnly(ctx, event.id);
+  clearPairingsPrepState(ctx, event.id);
+
+  writePairingsPrepState(ctx, event.id, {
+    targetRound,
+    recordIndex: {},
+    seenKeys: [],
+    pairings: []
+  });
+
+  const parseBatchTotal = Math.ceil(jsonMeta.rowSliceCount / PAIRINGS_ROW_SLICE_PARSE_BATCH);
+
+  ctx.log.info("pairings import parse batches scheduled", {
+    externalEventId: String(event.externalEventId),
+    targetRound,
+    rowSliceCount: jsonMeta.rowSliceCount,
+    parseBatchTotal
+  });
+
+  return { targetRound, parseBatchTotal };
+}
+
+function parsePreparePairingsBatch(
+  ctx: ServerContext,
+  event: TableRow,
+  batchIndex: number
+): { batchIndex: number; parseBatchTotal: number; done: boolean } {
+  const jsonMeta = readPairingsJsonMeta(ctx, event.id);
+
+  if (!jsonMeta || jsonMeta.rowSliceCount < 1) {
+    throw new Error("pairings JSON slices not fetched");
+  }
+
+  const parseBatchTotal = Math.ceil(jsonMeta.rowSliceCount / PAIRINGS_ROW_SLICE_PARSE_BATCH);
+
+  if (batchIndex < 0 || batchIndex >= parseBatchTotal) {
+    throw new Error(`invalid pairings parse batch index ${batchIndex}`);
+  }
+
+  const state = readPairingsPrepState(ctx, event.id);
+
+  if (!state) {
+    throw new Error("pairings import parse not started");
+  }
+
+  const rowSliceStart = batchIndex * PAIRINGS_ROW_SLICE_PARSE_BATCH;
+  const rowSliceEnd = Math.min(
+    rowSliceStart + PAIRINGS_ROW_SLICE_PARSE_BATCH,
+    jsonMeta.rowSliceCount
+  );
+
+  const updated = parsePairingsPrepBatch(
+    ctx,
+    event.id,
+    state.targetRound,
+    rowSliceStart,
+    rowSliceEnd,
+    state
+  );
+
+  writePairingsPrepState(ctx, event.id, updated);
+
+  return {
+    batchIndex,
+    parseBatchTotal,
+    done: batchIndex === parseBatchTotal - 1
+  };
+}
+
+function finalizePreparePairingsFromJsonSlices(
+  ctx: ServerContext,
+  event: TableRow
+): {
+  roundNumber: number;
+  pairingCount: number;
+  chunkTotal: number;
+  title: string;
+} {
+  const externalEventId = String(event.externalEventId);
+  const state = readPairingsPrepState(ctx, event.id);
+
+  if (!state) {
+    throw new Error("pairings import parse not started");
+  }
+
+  const parsedPairings = state.pairings;
+
+  if (parsedPairings.length === 0) {
+    throw new Error(`nenhuma partida encontrada para a rodada ${state.targetRound}`);
+  }
+
+  const compactRows = parsedPairings.map((pairing) => compactPairing(pairing));
+  const chunkTotal = storePairingsStagingChunks(ctx, event.id, compactRows);
+  const title = String(event.title);
+  const importedAt = new Date().toISOString();
+
+  writePairingsStagingMeta(ctx, event.id, {
+    roundNumber: state.targetRound,
+    pairingCount: parsedPairings.length,
+    chunkTotal,
+    title,
+    importedAt
+  });
+
+  clearPairingsPrepState(ctx, event.id);
+
+  ctx.log.info("pairings staged for chunked import", {
+    externalEventId,
+    roundNumber: state.targetRound,
+    pairingCount: parsedPairings.length,
+    chunkTotal
+  });
+
+  return {
+    roundNumber: state.targetRound,
+    pairingCount: parsedPairings.length,
+    chunkTotal,
+    title
+  };
+}
+
 async function preparePairingsStaging(
   ctx: ServerContext,
   event: TableRow,
@@ -1156,7 +1423,7 @@ async function preparePairingsStaging(
   let jsonBody = "";
 
   if (options?.fromJsonSlices) {
-    jsonBody = assemblePairingsJsonFromSlices(ctx, event.id);
+    throw new Error("use preparePairingsImportBegin/ParseBatch/Finalize for JSON slice imports");
   } else if (
     !options?.force &&
     pairingsImportFresh(ctx, event.id, liveRound) &&
@@ -1170,12 +1437,7 @@ async function preparePairingsStaging(
     replaceSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id, jsonBody);
   }
 
-  const storedRound = parseEventRound(String(event.currentRound));
-  const standingsRoundFromBody = detectCurrentRoundFromPayload(jsonBody);
-  const targetRound =
-    htmlRound !== null
-      ? Math.max(htmlRound, standingsRoundFromBody, storedRound)
-      : resolveCurrentRound(null, Math.max(standingsRoundFromBody, storedRound));
+  const targetRound = resolvePairingsTargetRound(ctx, event, htmlRound, jsonBody);
 
   const { roundNumber, pairings: parsedPairings } = parsePairingsForTargetRound(
     ctx,
@@ -1687,7 +1949,7 @@ export default capsule({
       return { eventId: created.id };
     }),
 
-    preparePairingsImport: mutation(async (ctx, force?: boolean) => {
+    preparePairingsImportBegin: mutation(async (ctx) => {
       const serverCtx = ctx as ServerContext;
       const event = getActiveEvent(serverCtx);
 
@@ -1713,14 +1975,19 @@ export default capsule({
       trimRefreshRuns(serverCtx, event.id);
       serverCtx.log.info("pairings import staging started", { externalEventId });
 
-      try {
-        const staged = await preparePairingsStaging(serverCtx, event, {
-          force: Boolean(force),
-          fetchPageHtml: false,
-          fromJsonSlices: true
-        });
+      return beginPreparePairingsFromJsonSlices(serverCtx, event);
+    }),
 
-        return staged;
+    preparePairingsImportParseBatch: mutation((ctx, batchIndex: number) => {
+      const serverCtx = ctx as ServerContext;
+      const event = getActiveEvent(serverCtx);
+
+      if (!event) {
+        throw new Error("no active event");
+      }
+
+      try {
+        return parsePreparePairingsBatch(serverCtx, event, batchIndex);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const run = getLatestRunningRefreshRun(serverCtx, event.id);
@@ -1733,7 +2000,41 @@ export default capsule({
           });
         }
 
-        serverCtx.log.error("pairings import staging failed", { externalEventId, message });
+        serverCtx.log.error("pairings import parse batch failed", {
+          externalEventId: String(event.externalEventId),
+          batchIndex,
+          message
+        });
+        throw error;
+      }
+    }),
+
+    preparePairingsImportFinalize: mutation((ctx) => {
+      const serverCtx = ctx as ServerContext;
+      const event = getActiveEvent(serverCtx);
+
+      if (!event) {
+        throw new Error("no active event");
+      }
+
+      try {
+        return finalizePreparePairingsFromJsonSlices(serverCtx, event);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const run = getLatestRunningRefreshRun(serverCtx, event.id);
+
+        if (run) {
+          serverCtx.db.refreshRuns.update(run.id, {
+            finishedAt: new Date().toISOString(),
+            status: "error",
+            message
+          });
+        }
+
+        serverCtx.log.error("pairings import finalize failed", {
+          externalEventId: String(event.externalEventId),
+          message
+        });
         throw error;
       }
     }),
