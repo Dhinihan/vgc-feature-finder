@@ -246,6 +246,7 @@ export function App() {
       );
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : "Falha ao configurar evento.");
+      setAutoRefreshAttempted(false);
     } finally {
       setIsRefreshing(false);
     }
@@ -267,6 +268,7 @@ export function App() {
       );
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : "Falha na atualização.");
+      setAutoRefreshAttempted(false);
     } finally {
       setIsRefreshing(false);
     }
