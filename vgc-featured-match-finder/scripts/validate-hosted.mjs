@@ -125,7 +125,17 @@ async function main() {
         report.errors.push("no loading indicator after clicking Atualizar partidas");
       }
 
-      await refreshBtn.waitFor({ state: "enabled", timeout: 180_000 });
+      await page.waitForFunction(
+        () => {
+          const buttons = Array.from(document.querySelectorAll("button"));
+          return buttons.some(
+            (button) =>
+              button.textContent?.trim() === "Atualizar partidas" && !button.disabled
+          );
+        },
+        null,
+        { timeout: 180_000 }
+      );
       await page.waitForTimeout(1_500);
     }
 
@@ -176,7 +186,17 @@ async function main() {
     const refreshOnlyBtn = page.getByRole("button", { name: /^Atualizar partidas$/ });
     if (await refreshOnlyBtn.isEnabled()) {
       await refreshOnlyBtn.click();
-      await refreshOnlyBtn.waitFor({ state: "enabled", timeout: 180_000 });
+      await page.waitForFunction(
+        () => {
+          const buttons = Array.from(document.querySelectorAll("button"));
+          return buttons.some(
+            (button) =>
+              button.textContent?.trim() === "Atualizar partidas" && !button.disabled
+          );
+        },
+        null,
+        { timeout: 180_000 }
+      );
       const roundRefreshOnly = await waitForRound(page, expected.current, 30_000);
       report.roundAfterRefreshOnly = roundRefreshOnly;
       report.steps.push("refresh without reconfigure");
