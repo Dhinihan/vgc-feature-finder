@@ -26,6 +26,7 @@ type FilterMode = "pending" | "finished" | "hide-missing" | "top10" | "top25" | 
 
 const EMPTY_DASHBOARD: EventDashboard = {
   event: null,
+  needsPairingsRefresh: false,
   rankedPairings: [],
   stats: {
     totalPairings: 0,
@@ -107,6 +108,7 @@ export function App() {
   const dashboard: EventDashboard = {
     ...EMPTY_DASHBOARD,
     ...dashboardRaw,
+    needsPairingsRefresh: dashboardRaw?.needsPairingsRefresh ?? false,
     rankedPairings: dashboardRaw?.rankedPairings ?? [],
     stats: { ...EMPTY_DASHBOARD.stats, ...dashboardRaw?.stats }
   };
@@ -144,6 +146,7 @@ export function App() {
   const [filterMode, setFilterMode] = useState<FilterMode>("all");
   const [statusMessage, setStatusMessage] = useState("");
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [autoRefreshAttempted, setAutoRefreshAttempted] = useState(false);
   const [overrideForm, setOverrideForm] = useState({
     tournamentNormalizedName: "",
     tournamentCountry: "*",
@@ -153,6 +156,7 @@ export function App() {
 
   useEffect(() => {
     if (!dashboard.event) {
+      setAutoRefreshAttempted(false);
       return;
     }
 
@@ -203,7 +207,17 @@ export function App() {
       setStatusMessage(
         `Importando partidas ${chunkIndex + 1}/${staged.chunkTotal} (rodada ${staged.roundNumber})...`
       );
-      const committed = await commitPairingsChunk(chunkIndex);
+      let committed;
+      try {
+        committed = await commitPairingsChunk(chunkIndex);
+      } catch (firstError) {
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        try {
+          committed = await commitPairingsChunk(chunkIndex);
+        } catch {
+          throw firstError;
+        }
+      }
       if (committed.done) {
         result = {
           roundNumber: committed.roundNumber,
@@ -246,12 +260,10 @@ export function App() {
     setStatusMessage("Atualizando partidas no PokéData...");
 
     try {
-      const roundSync = await syncCurrentRound();
       const result = await importPairingsInChunks(true);
-      const roundNumber = Math.max(roundSync.roundNumber, result.roundNumber);
       const cpCount = cpMeta?.playerCount ?? 0;
       setStatusMessage(
-        `Atualização concluída. Rodada ${roundNumber}, ${result.pairingCount} partidas. CP no banco: ${formatNumber(cpCount)}.`
+        `Atualização concluída. Rodada ${result.roundNumber}, ${result.pairingCount} partidas. CP no banco: ${formatNumber(cpCount)}.`
       );
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : "Falha na atualização.");
@@ -259,6 +271,25 @@ export function App() {
       setIsRefreshing(false);
     }
   }
+
+  useEffect(() => {
+    if (!dashboard.event || isRefreshing || autoRefreshAttempted) {
+      return;
+    }
+
+    if (!dashboard.needsPairingsRefresh) {
+      return;
+    }
+
+    setAutoRefreshAttempted(true);
+    setStatusMessage("Sincronizando partidas da rodada atual automaticamente...");
+    void onRefreshPairings();
+  }, [
+    dashboard.event?.id,
+    dashboard.needsPairingsRefresh,
+    isRefreshing,
+    autoRefreshAttempted
+  ]);
 
   async function onSaveOverride(event: Event) {
     event.preventDefault();
@@ -318,6 +349,13 @@ export function App() {
           <div>
             <p className="text-xs uppercase tracking-wide text-slate-400">Rodada atual</p>
             <p className="mt-1 text-3xl font-semibold">{dashboard.event?.currentRound ?? "—"}</p>
+            {dashboard.event &&
+            dashboard.event.displayRound > 0 &&
+            dashboard.event.displayRound < dashboard.event.currentRound ? (
+              <p className="mt-1 text-sm text-amber-300">
+                Exibindo rodada {dashboard.event.displayRound} até importar a {dashboard.event.currentRound}.
+              </p>
+            ) : null}
           </div>
           <div>
             <p className="text-xs uppercase tracking-wide text-slate-400">Última atualização</p>
@@ -544,7 +582,9 @@ export function App() {
                   <tr>
                     <td className="px-3 py-6 text-slate-400" colSpan={7}>
                       {dashboard.stats.totalPairings === 0
-                        ? "Nenhuma partida carregada. Configure o evento e clique Atualizar."
+                        ? dashboard.needsPairingsRefresh
+                          ? "Importando partidas da rodada atual..."
+                          : "Nenhuma partida carregada. Configure o evento e clique Atualizar."
                         : "Nenhuma partida neste filtro. Tente o filtro 'Todas' ou desmarque pendentes."}
                     </td>
                   </tr>
