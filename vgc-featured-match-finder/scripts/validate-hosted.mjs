@@ -1,6 +1,10 @@
 import { chromium } from "playwright";
+import { execFile } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 const APP_URL =
   process.env.APP_URL ?? "https://vgc-featured-match-finder.lakebed.app/";
@@ -8,12 +12,7 @@ const EVENT_ID = process.env.EVENT_ID ?? "0000187";
 const POKE_DATA_PAGE = `https://www.pokedata.ovh/standingsVGC/${EVENT_ID}/masters/`;
 const ARTIFACTS = process.env.ARTIFACTS_DIR ?? "/opt/cursor/artifacts/screenshots";
 
-async function fetchExpectedRound() {
-  const response = await fetch(POKE_DATA_PAGE);
-  if (!response.ok) {
-    throw new Error(`PokéData HTTP ${response.status}`);
-  }
-  const html = await response.text();
+function parseRoundFromHtml(html) {
   const match = html.match(/Round\s+(\d+)\s*\/\s*(\d+)/i);
   if (!match) {
     throw new Error("could not parse Round N/M from PokéData HTML");
@@ -22,6 +21,37 @@ async function fetchExpectedRound() {
     current: Number.parseInt(match[1], 10),
     total: Number.parseInt(match[2], 10)
   };
+}
+
+async function fetchExpectedRound() {
+  const envRound = Number.parseInt(process.env.EXPECTED_ROUND ?? "", 10);
+  if (!Number.isNaN(envRound) && envRound > 0) {
+    return { current: envRound, total: 12 };
+  }
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetch(POKE_DATA_PAGE, {
+        signal: AbortSignal.timeout(90_000)
+      });
+      if (!response.ok) {
+        throw new Error(`PokéData HTTP ${response.status}`);
+      }
+      return parseRoundFromHtml(await response.text());
+    } catch (error) {
+      if (attempt === 2) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 4_000 * (attempt + 1)));
+    }
+  }
+
+  const { stdout } = await execFileAsync(
+    "curl",
+    ["-s", "--max-time", "90", POKE_DATA_PAGE],
+    { maxBuffer: 10 * 1024 * 1024 }
+  );
+  return parseRoundFromHtml(stdout);
 }
 
 async function readDisplayedRound(page) {
@@ -37,8 +67,40 @@ async function readDisplayedRound(page) {
 
 async function readStatusRound(page) {
   const body = await page.locator("body").innerText();
-  const match = body.match(/Atualização concluída\.\s*Rodada\s+(\d+)/i);
+  const match = body.match(
+    /(?:Atualização concluída|Evento configurado)\.\s*Rodada\s+(\d+)/i
+  );
   return match ? Number.parseInt(match[1], 10) : null;
+}
+
+async function readTournamentRecordBadgeCount(page) {
+  const badges = await page.locator("span.rounded.bg-slate-800").allTextContents();
+  return badges.filter((text) => /^\d+-\d+(-\d+)?$/.test(text.trim())).length;
+}
+
+async function waitForRefreshButtonReady(page, timeoutMs) {
+  await page.waitForFunction(
+    () => {
+      const buttons = Array.from(document.querySelectorAll("button"));
+      return buttons.some(
+        (button) => button.textContent?.trim() === "Atualizar partidas" && !button.disabled
+      );
+    },
+    null,
+    { timeout: timeoutMs }
+  );
+}
+
+async function waitForPartidasStat(page, minCount, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const count = await readPartidasStat(page);
+    if (count !== null && count >= minCount) {
+      return count;
+    }
+    await page.waitForTimeout(2_000);
+  }
+  return readPartidasStat(page);
 }
 
 async function readPartidasStat(page) {
@@ -105,13 +167,41 @@ async function main() {
     await page.getByRole("button", { name: /Salvar evento/i }).click();
     report.steps.push("configured event");
 
+    report.sawAutoImportIndicator = await page
+      .getByText(/Configurando evento|Baixando standings|Importando partidas|Sincronizando partidas/i)
+      .first()
+      .isVisible({ timeout: 10_000 })
+      .catch(() => false);
+
+    await waitForRefreshButtonReady(page, 240_000);
+    report.steps.push("import finished after configure");
+
     const roundAfterConfigure = await waitForRound(page, expected.current, 30_000);
     report.roundAfterConfigure = roundAfterConfigure;
+    report.partidasAfterConfigure = await waitForPartidasStat(page, 1, 10_000);
+    report.recordBadgesAfterConfigure = await readTournamentRecordBadgeCount(page);
 
     if (roundAfterConfigure !== expected.current) {
       report.errors.push(
         `after configure: UI shows rodada ${roundAfterConfigure}, PokéData is ${expected.current}`
       );
+    }
+
+    if (report.partidasAfterConfigure !== null && report.partidasAfterConfigure < 1) {
+      report.errors.push("Partidas stat is zero after configure/import");
+    }
+
+    if (report.recordBadgesAfterConfigure < 4) {
+      if (report.recordBadgesAfterConfigure < 4) {
+        report.errors.push(
+          `expected tournament record badges after configure, got ${report.recordBadgesAfterConfigure}`
+        );
+      }
+    }
+
+    const bodyAfterConfigure = await page.locator("body").innerText();
+    if (/Source runtime exceeded|runtime exceeded/i.test(bodyAfterConfigure)) {
+      report.errors.push("Lakebed runtime error visible after configure");
     }
 
     await page.screenshot({ path: join(ARTIFACTS, "02-event-configured.png"), fullPage: true });
@@ -124,7 +214,7 @@ async function main() {
       report.steps.push("clicked refresh");
 
       const updatingBtn = page.getByRole("button", { name: /Atualizando/i });
-      const loadingStatus = page.getByText(/Buscando partidas no PokéData/i);
+      const loadingStatus = page.getByText(/Buscando partidas no PokéData|Importando partidas/i);
       report.sawRefreshLoadingIndicator =
         (await updatingBtn.isVisible({ timeout: 5_000 }).catch(() => false)) ||
         (await loadingStatus.isVisible({ timeout: 5_000 }).catch(() => false));
@@ -133,17 +223,7 @@ async function main() {
         report.errors.push("no loading indicator after clicking Atualizar partidas");
       }
 
-      await page.waitForFunction(
-        () => {
-          const buttons = Array.from(document.querySelectorAll("button"));
-          return buttons.some(
-            (button) =>
-              button.textContent?.trim() === "Atualizar partidas" && !button.disabled
-          );
-        },
-        null,
-        { timeout: 180_000 }
-      );
+      await waitForRefreshButtonReady(page, 240_000);
       await page.waitForTimeout(1_500);
     }
 
@@ -153,6 +233,7 @@ async function main() {
     report.partidasStat = await readPartidasStat(page);
     report.featuredPairingsRows = await readFeaturedPairingsRowCount(page);
     report.tableRows = report.featuredPairingsRows;
+    report.recordBadges = await readTournamentRecordBadgeCount(page);
     report.hasScore = /Relevância|completo|CP ausente/i.test(await page.locator("body").innerText());
     report.hasPairingsTable = report.featuredPairingsRows > 1;
 
@@ -176,14 +257,20 @@ async function main() {
       report.errors.push("no table rows after refresh");
     }
 
+    if (report.recordBadges < 4) {
+      report.errors.push(`expected tournament record badges, got ${report.recordBadges}`);
+    }
+
     await page.screenshot({ path: join(ARTIFACTS, "03-after-refresh.png"), fullPage: true });
 
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("text=VGC Featured Match Finder", { timeout: 60_000 });
-    await page.waitForTimeout(2_000);
+    await waitForPartidasStat(page, 1, 120_000);
 
     const roundAfterReload = await readDisplayedRound(page);
     report.roundAfterReload = roundAfterReload;
+    report.partidasAfterReload = await readPartidasStat(page);
+    report.recordBadgesAfterReload = await readTournamentRecordBadgeCount(page);
     report.steps.push("reloaded page");
 
     if (roundAfterReload !== expected.current) {
@@ -192,21 +279,16 @@ async function main() {
       );
     }
 
+    if (report.partidasAfterReload !== null && report.partidasAfterReload < 1) {
+      report.errors.push("Partidas stat is zero after reload");
+    }
+
     const refreshOnlyBtn = page.getByRole("button", { name: /^Atualizar partidas$/ });
     if (await refreshOnlyBtn.isEnabled()) {
       await refreshOnlyBtn.click();
-      await page.waitForFunction(
-        () => {
-          const buttons = Array.from(document.querySelectorAll("button"));
-          return buttons.some(
-            (button) =>
-              button.textContent?.trim() === "Atualizar partidas" && !button.disabled
-          );
-        },
-        null,
-        { timeout: 180_000 }
-      );
+      await waitForRefreshButtonReady(page, 240_000);
       const roundRefreshOnly = await waitForRound(page, expected.current, 30_000);
+      report.partidasRefreshOnly = await readPartidasStat(page);
       report.roundAfterRefreshOnly = roundRefreshOnly;
       report.steps.push("refresh without reconfigure");
 
@@ -224,8 +306,11 @@ async function main() {
 
   report.ok =
     report.errors.length === 0 &&
+    report.roundAfterConfigure === expected.current &&
     report.roundAfterRefresh === expected.current &&
-    report.hasPairingsTable;
+    report.hasPairingsTable &&
+    (report.partidasStat ?? 0) >= 1 &&
+    (report.recordBadges ?? 0) >= 4;
 
   await writeFile(join(ARTIFACTS, "validation-report.json"), JSON.stringify(report, null, 2));
   console.log(JSON.stringify(report, null, 2));

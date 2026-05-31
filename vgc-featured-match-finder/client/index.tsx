@@ -118,6 +118,10 @@ export function App() {
 
   const configureEvent = useMutation<[string, string, string], { eventId: string }>("configureEvent");
   const syncCurrentRound = useMutation<[], { roundNumber: number }>("syncCurrentRound");
+  const fetchPairingsJsonSlice = useMutation<
+    [number, boolean | undefined],
+    { sliceIndex: number; sliceTotal: number; done: boolean }
+  >("fetchPairingsJsonSlice");
   const preparePairingsImport = useMutation<
     [boolean | undefined],
     {
@@ -195,6 +199,16 @@ export function App() {
     unmatchedPlayerCount: number;
     ambiguousPlayerCount: number;
   }> {
+    await syncCurrentRound().catch(() => undefined);
+
+    let sliceTotal = 1;
+    for (let sliceIndex = 0; sliceIndex < sliceTotal; sliceIndex++) {
+      setStatusMessage(`Baixando standings ${sliceIndex + 1}/${sliceTotal}...`);
+      const fetched = await fetchPairingsJsonSlice(sliceIndex, sliceIndex === 0 ? force : false);
+      sliceTotal = fetched.sliceTotal;
+    }
+
+    setStatusMessage("Preparando partidas para importação...");
     const staged = await preparePairingsImport(force);
     let result = {
       roundNumber: staged.roundNumber,
