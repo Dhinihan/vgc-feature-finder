@@ -55,6 +55,8 @@ const PAYLOAD_SOURCE = {
 } as const;
 const REFRESH_RUN_LIMIT = 20;
 const PAIRINGS_STAGING_META = "meta";
+const PAIRINGS_JSON_META = "json-meta";
+const PAIRINGS_JSON_SLICE_PREFIX = "json-";
 const PAIRINGS_ROWS_PER_COMMIT = 6;
 const WILDCARD_COUNTRY = "*";
 const MAX_PERSISTED_PAYLOAD_BYTES = 60_000;
@@ -590,26 +592,207 @@ function parseContentRangeTotal(contentRange: string | null): number | null {
   return Number.isNaN(total) ? null : total;
 }
 
-async function fetchTextLarge(url: string): Promise<string> {
+type PairingsJsonMeta = {
+  totalBytes: number;
+  sliceCount: number;
+  jsonUrl: string;
+};
+
+function pairingsJsonSliceKey(sliceIndex: number): string {
+  return `${PAIRINGS_JSON_SLICE_PREFIX}${sliceIndex}`;
+}
+
+function isPairingsJsonChunkIndex(chunkIndex: string): boolean {
+  return chunkIndex === PAIRINGS_JSON_META || chunkIndex.startsWith(PAIRINGS_JSON_SLICE_PREFIX);
+}
+
+function isPairingsStagingChunkIndex(chunkIndex: string): boolean {
+  return chunkIndex === PAIRINGS_STAGING_META || /^\d+$/.test(chunkIndex);
+}
+
+async function probePairingsJsonSize(
+  url: string
+): Promise<{ totalBytes: number; sliceCount: number; singleFetch: boolean }> {
   const probe = await fetch(url, { headers: { Range: "bytes=0-0" } });
 
   if (probe.status === 206) {
     const totalBytes = parseContentRangeTotal(probe.headers.get("Content-Range"));
 
     if (totalBytes !== null && totalBytes > LAKEBED_MAX_FETCH_BYTES) {
-      const parts: string[] = [];
+      return {
+        totalBytes,
+        sliceCount: Math.ceil(totalBytes / LAKEBED_MAX_FETCH_BYTES),
+        singleFetch: false
+      };
+    }
 
-      for (let start = 0; start < totalBytes; start += LAKEBED_MAX_FETCH_BYTES) {
-        const end = Math.min(start + LAKEBED_MAX_FETCH_BYTES - 1, totalBytes - 1);
-        const part = await fetchText(url, { headers: { Range: `bytes=${start}-${end}` } });
-        parts.push(part);
-      }
-
-      return parts.join("");
+    if (totalBytes !== null) {
+      return { totalBytes, sliceCount: 1, singleFetch: true };
     }
   }
 
-  return fetchText(url);
+  const body = await fetchText(url);
+  return { totalBytes: body.length, sliceCount: 1, singleFetch: true };
+}
+
+async function fetchPairingsJsonSliceBody(
+  url: string,
+  sliceIndex: number,
+  totalBytes: number,
+  singleFetch: boolean
+): Promise<string> {
+  if (singleFetch) {
+    return fetchText(url);
+  }
+
+  const start = sliceIndex * LAKEBED_MAX_FETCH_BYTES;
+  const end = Math.min(start + LAKEBED_MAX_FETCH_BYTES - 1, totalBytes - 1);
+  return fetchText(url, { headers: { Range: `bytes=${start}-${end}` } });
+}
+
+function clearPairingsJsonSlices(ctx: ServerContext, eventId: string): void {
+  const rows = ctx.db.pairingsChunks
+    .where("eventId", eventId)
+    .all()
+    .filter((row) => isPairingsJsonChunkIndex(String(row.chunkIndex)));
+  deleteAllRows(ctx, "pairingsChunks", rows);
+}
+
+function readPairingsJsonMeta(ctx: ServerContext, eventId: string): PairingsJsonMeta | null {
+  const row = ctx.db.pairingsChunks
+    .where("eventId", eventId)
+    .all()
+    .find((item) => String(item.chunkIndex) === PAIRINGS_JSON_META);
+
+  if (!row) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(String(row.body)) as PairingsJsonMeta;
+  } catch {
+    return null;
+  }
+}
+
+function writePairingsJsonMeta(ctx: ServerContext, eventId: string, meta: PairingsJsonMeta): void {
+  const existing = ctx.db.pairingsChunks
+    .where("eventId", eventId)
+    .all()
+    .filter((item) => String(item.chunkIndex) === PAIRINGS_JSON_META);
+  deleteAllRows(ctx, "pairingsChunks", existing);
+
+  ctx.db.pairingsChunks.insert({
+    eventId,
+    chunkIndex: PAIRINGS_JSON_META,
+    body: JSON.stringify(meta)
+  });
+}
+
+function assemblePairingsJsonFromSlices(ctx: ServerContext, eventId: string): string {
+  const meta = readPairingsJsonMeta(ctx, eventId);
+  if (!meta) {
+    throw new Error("pairings JSON slices not fetched");
+  }
+
+  const parts: string[] = [];
+  for (let index = 0; index < meta.sliceCount; index++) {
+    const row = ctx.db.pairingsChunks
+      .where("eventId", eventId)
+      .all()
+      .find((item) => String(item.chunkIndex) === pairingsJsonSliceKey(index));
+
+    if (!row) {
+      throw new Error(`missing pairings JSON slice ${index}`);
+    }
+
+    parts.push(String(row.body));
+  }
+
+  return parts.join("");
+}
+
+async function fetchPairingsJsonSlice(
+  ctx: ServerContext,
+  event: TableRow,
+  sliceIndex: number,
+  options?: { force?: boolean }
+): Promise<{ sliceIndex: number; sliceTotal: number; done: boolean }> {
+  const externalEventId = String(event.externalEventId);
+  const division = String(event.division) || "masters";
+  const jsonUrl = standingsJsonUrl(externalEventId, division);
+
+  if (sliceIndex === 0 || options?.force) {
+    clearPairingsJsonSlices(ctx, event.id);
+  }
+
+  let meta = readPairingsJsonMeta(ctx, event.id);
+
+  if (!meta || options?.force) {
+    const probed = await probePairingsJsonSize(jsonUrl);
+    meta = {
+      totalBytes: probed.totalBytes,
+      sliceCount: probed.sliceCount,
+      jsonUrl
+    };
+    writePairingsJsonMeta(ctx, event.id, meta);
+  }
+
+  if (sliceIndex < 0 || sliceIndex >= meta.sliceCount) {
+    throw new Error(`invalid pairings JSON slice index ${sliceIndex}`);
+  }
+
+  const existing = ctx.db.pairingsChunks
+    .where("eventId", event.id)
+    .all()
+    .find((row) => String(row.chunkIndex) === pairingsJsonSliceKey(sliceIndex));
+
+  if (!existing || options?.force) {
+    if (existing) {
+      deleteAllRows(ctx, "pairingsChunks", [existing]);
+    }
+
+    const body = await fetchPairingsJsonSliceBody(
+      jsonUrl,
+      sliceIndex,
+      meta.totalBytes,
+      meta.sliceCount === 1 && meta.totalBytes <= LAKEBED_MAX_FETCH_BYTES
+    );
+
+    ctx.db.pairingsChunks.insert({
+      eventId: event.id,
+      chunkIndex: pairingsJsonSliceKey(sliceIndex),
+      body
+    });
+
+    ctx.log.info("pairings JSON slice fetched", {
+      externalEventId,
+      sliceIndex,
+      sliceTotal: meta.sliceCount,
+      byteLength: body.length
+    });
+  }
+
+  return {
+    sliceIndex,
+    sliceTotal: meta.sliceCount,
+    done: sliceIndex === meta.sliceCount - 1
+  };
+}
+
+async function fetchTextLarge(url: string): Promise<string> {
+  const probed = await probePairingsJsonSize(url);
+
+  if (probed.singleFetch) {
+    return fetchPairingsJsonSliceBody(url, 0, probed.totalBytes, true);
+  }
+
+  const parts: string[] = [];
+  for (let index = 0; index < probed.sliceCount; index++) {
+    parts.push(await fetchPairingsJsonSliceBody(url, index, probed.totalBytes, false));
+  }
+
+  return parts.join("");
 }
 
 function standingsJsonUrl(externalEventId: string, division: string): string {
@@ -745,6 +928,14 @@ function clearPairingsChunks(ctx: ServerContext, eventId: string): void {
   deleteAllRows(ctx, "pairingsChunks", rows);
 }
 
+function clearPairingsStagingOnly(ctx: ServerContext, eventId: string): void {
+  const rows = ctx.db.pairingsChunks
+    .where("eventId", eventId)
+    .all()
+    .filter((row) => isPairingsStagingChunkIndex(String(row.chunkIndex)));
+  deleteAllRows(ctx, "pairingsChunks", rows);
+}
+
 function readPairingsStagingMeta(ctx: ServerContext, eventId: string): PairingsStagingMeta | null {
   const row = ctx.db.pairingsChunks
     .where("eventId", eventId)
@@ -791,7 +982,7 @@ function storePairingsStagingChunks(
   eventId: string,
   compactRows: CompactPairingRow[]
 ): number {
-  clearPairingsChunks(ctx, eventId);
+  clearPairingsStagingOnly(ctx, eventId);
 
   const chunks =
     compactRows.length <= PAIRINGS_ROWS_PER_COMMIT
@@ -864,7 +1055,7 @@ function finalizePairingsImport(
 async function preparePairingsStaging(
   ctx: ServerContext,
   event: TableRow,
-  options?: { force?: boolean; fetchPageHtml?: boolean }
+  options?: { force?: boolean; fetchPageHtml?: boolean; fromJsonSlices?: boolean }
 ): Promise<{
   roundNumber: number;
   pairingCount: number;
@@ -899,7 +1090,9 @@ async function preparePairingsStaging(
   const standingsRound = cached ? detectCurrentRoundFromPayload(String(cached.body)) : null;
   let jsonBody = "";
 
-  if (
+  if (options?.fromJsonSlices) {
+    jsonBody = assemblePairingsJsonFromSlices(ctx, event.id);
+  } else if (
     !options?.force &&
     pairingsImportFresh(ctx, event.id, liveRound) &&
     cached &&
@@ -1456,10 +1649,10 @@ export default capsule({
       serverCtx.log.info("pairings import staging started", { externalEventId });
 
       try {
-        await syncCurrentRoundFromPokeData(serverCtx, event);
         const staged = await preparePairingsStaging(serverCtx, event, {
           force: Boolean(force),
-          fetchPageHtml: true
+          fetchPageHtml: false,
+          fromJsonSlices: true
         });
 
         return staged;
@@ -1478,6 +1671,19 @@ export default capsule({
         serverCtx.log.error("pairings import staging failed", { externalEventId, message });
         throw error;
       }
+    }),
+
+    fetchPairingsJsonSlice: mutation(async (ctx, sliceIndex: number, force?: boolean) => {
+      const serverCtx = ctx as ServerContext;
+      const event = getActiveEvent(serverCtx);
+
+      if (!event) {
+        throw new Error("no active event");
+      }
+
+      return fetchPairingsJsonSlice(serverCtx, event, sliceIndex, {
+        force: Boolean(force)
+      });
     }),
 
     commitPairingsChunk: mutation((ctx, chunkIndex: number) => {
