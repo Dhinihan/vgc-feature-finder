@@ -1,5 +1,26 @@
 # Deploy e claim
 
+## Deploy automático (merge em `main`)
+
+Cada push/merge em `main` que altere `vgc-featured-match-finder/` dispara o workflow `.github/workflows/deploy.yml`, que roda `npx lakebed deploy` no Lakebed.
+
+Configure estes **repository secrets** no GitHub (`Settings → Secrets and variables → Actions`):
+
+| Secret | Valor |
+|--------|--------|
+| `LAKEBED_DEPLOY_ID` | ID do deploy (ex.: `dep_2iEShdk`) — em `.lakebed/deploy.json` local |
+| `LAKEBED_CLAIM_TOKEN` | Token de claim (ex.: `tok_...`) — em `.lakebed/deploy.json` local |
+| `LAKEBED_SERVER_ENV` | Conteúdo completo de `.env.lakebed.server` (multiline) |
+
+Exemplo local para criar/atualizar os secrets (requer `gh` autenticado):
+
+```bash
+cd vgc-featured-match-finder
+gh secret set LAKEBED_DEPLOY_ID --body "$(jq -r .deployId .lakebed/deploy.json)"
+gh secret set LAKEBED_CLAIM_TOKEN --body "$(jq -r .claimToken .lakebed/deploy.json)"
+gh secret set LAKEBED_SERVER_ENV < .env.lakebed.server
+```
+
 ## 1. Claim (uma vez, no browser)
 
 Abra e entre com GitHub:

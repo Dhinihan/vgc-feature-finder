@@ -1,0 +1,62 @@
+name: Deploy to Lakebed
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "vgc-featured-match-finder/**"
+      - ".github/workflows/deploy.yml"
+
+concurrency:
+  group: lakebed-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vgc-featured-match-finder
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Configure Lakebed deploy metadata
+        env:
+          LAKEBED_DEPLOY_ID: ${{ secrets.LAKEBED_DEPLOY_ID }}
+          LAKEBED_CLAIM_TOKEN: ${{ secrets.LAKEBED_CLAIM_TOKEN }}
+        run: |
+          if [ -z "$LAKEBED_DEPLOY_ID" ] || [ -z "$LAKEBED_CLAIM_TOKEN" ]; then
+            echo "Missing LAKEBED_DEPLOY_ID or LAKEBED_CLAIM_TOKEN repository secrets."
+            exit 1
+          fi
+
+          mkdir -p .lakebed
+          jq -n \
+            --arg api "https://api.lakebed.dev" \
+            --arg claimToken "$LAKEBED_CLAIM_TOKEN" \
+            --arg deployId "$LAKEBED_DEPLOY_ID" \
+            --arg url "https://vgc-featured-match-finder.lakebed.app" \
+            '{api: $api, claimToken: $claimToken, deployId: $deployId, url: $url}' \
+            > .lakebed/deploy.json
+
+      - name: Configure server environment
+        env:
+          LAKEBED_SERVER_ENV: ${{ secrets.LAKEBED_SERVER_ENV }}
+        run: |
+          if [ -z "$LAKEBED_SERVER_ENV" ]; then
+            echo "Missing LAKEBED_SERVER_ENV repository secret."
+            exit 1
+          fi
+
+          printf '%s\n' "$LAKEBED_SERVER_ENV" > .env.lakebed.server
+
+      - name: Deploy to Lakebed
+        run: npx lakebed deploy
