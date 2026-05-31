@@ -28,6 +28,7 @@ import {
   extractExternalEventId,
   parseChampionshipPointsPayload,
   parseCurrentRoundFromHtml,
+  resolveCurrentRound,
   parseEventTitleFromHtml,
   countPairingsInRound,
   parsePairingsForRound,
@@ -579,7 +580,7 @@ function applyPairingsPayload(
 } {
   const htmlRound = pageHtml ? parseCurrentRoundFromHtml(pageHtml) : null;
   const standingsRound = parsePairingsPayload(jsonBody).currentRound;
-  const currentRound = htmlRound ?? standingsRound;
+  const currentRound = resolveCurrentRound(htmlRound, standingsRound);
   const pairings = parsePairingsForRound(jsonBody, currentRound);
   const title = (pageHtml ? parseEventTitleFromHtml(pageHtml) : "") || String(event.title);
 
@@ -914,7 +915,7 @@ export default capsule({
       try {
         const result = await importPairingsForEvent(serverCtx, event, {
           force: true,
-          fetchPageHtml: false
+          fetchPageHtml: true
         });
         const now = new Date().toISOString();
 
