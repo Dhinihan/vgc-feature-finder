@@ -380,12 +380,16 @@ export function parseEventTitleFromHtml(html: string): string {
 }
 
 export function parseCurrentRoundFromHtml(html: string): number | null {
-  const match = html.match(/Round\s+(\d+)\s*\/\s*(\d+)/i);
-  if (!match) {
-    return null;
+  const patterns = [/Round\s+(\d+)\s*\/\s*(\d+)/i, /-\s*Round\s+(\d+)\s*\/\s*(\d+)/i];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match) {
+      return Number.parseInt(match[1], 10);
+    }
   }
 
-  return Number.parseInt(match[1], 10);
+  return null;
 }
 
 /** Prefer the most up-to-date round when PokéData HTML and JSON disagree. */
