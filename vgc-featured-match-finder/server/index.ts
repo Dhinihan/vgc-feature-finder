@@ -653,8 +653,9 @@ function appendPairingsJsonToRowSlices(ctx: ServerContext, eventId: string, chun
 
   let lastRow = rowRows.at(-1) ?? null;
   let remaining = chunk;
+  const maxRowWrites = Math.ceil(chunk.length / LAKEBED_MAX_ROW_BYTES) + 2;
 
-  while (remaining.length > 0) {
+  for (let writeIndex = 0; writeIndex < maxRowWrites && remaining.length > 0; writeIndex++) {
     const lastBody = lastRow ? String(lastRow.body) : "";
     const spaceInLastRow = LAKEBED_MAX_ROW_BYTES - lastBody.length;
 
