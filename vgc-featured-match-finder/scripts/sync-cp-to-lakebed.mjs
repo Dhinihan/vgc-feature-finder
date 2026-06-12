@@ -6,11 +6,17 @@
  * Usage:
  *   CP_IMPORT_SECRET=... APP_URL=https://vgc-featured-match-finder.lakebed.app node scripts/sync-cp-to-lakebed.mjs
  *   node scripts/sync-cp-to-lakebed.mjs --division masters
+ *   node scripts/sync-cp-to-lakebed.mjs --event-id=0000190
+ *   node scripts/sync-cp-to-lakebed.mjs --event-id 0000190 --division masters
  */
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseChampionshipPointsPayload } from "../shared/parsing.ts";
+import {
+  divisionJsonFileName,
+  extractStandingsPlayerNames,
+  parseChampionshipPointsPayload
+} from "../shared/parsing.ts";
 import { compactCpPlayers, chunkCompactPlayers } from "../shared/cp-storage.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -43,11 +49,23 @@ const division =
     ? process.argv[process.argv.indexOf("--division") + 1]
     : "masters");
 
+const eventIdArg = process.argv.find((arg) => arg.startsWith("--event-id="));
+const eventId =
+  eventIdArg?.split("=")[1] ??
+  (process.argv.includes("--event-id")
+    ? process.argv[process.argv.indexOf("--event-id") + 1]
+    : null);
+
 function divisionLabel(value) {
   const normalized = value.trim().toLowerCase();
   if (normalized === "juniors") return "Juniors";
   if (normalized === "seniors") return "Seniors";
   return "Masters";
+}
+
+function standingsJsonUrl(externalEventId, div) {
+  const divisionFile = divisionJsonFileName(div);
+  return `https://www.pokedata.ovh/standingsVGC/${externalEventId}/${div.toLowerCase()}/${externalEventId}_${divisionFile}.json`;
 }
 
 async function fetchRegionHtml(region, divLabel) {
@@ -68,6 +86,19 @@ async function fetchRegionHtml(region, divLabel) {
   return body;
 }
 
+async function fetchEventPlayerNames(externalEventId, div) {
+  const url = standingsJsonUrl(externalEventId, div);
+  console.log(`Buscando standings do evento ${externalEventId} (${div})...`);
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Standings ${externalEventId}: HTTP ${res.status}`);
+  }
+  const jsonBody = await res.text();
+  const names = extractStandingsPlayerNames(jsonBody);
+  console.log(`  ${names.size.toLocaleString()} jogadores no evento.`);
+  return names;
+}
+
 async function main() {
   const secret = loadEnvSecret();
   if (!secret) {
@@ -84,8 +115,17 @@ async function main() {
   }
 
   const payload = htmlParts.join("\n");
-  const players = parseChampionshipPointsPayload(payload);
-  console.log(`Parseados ${players.length.toLocaleString()} jogadores.`);
+  let players = parseChampionshipPointsPayload(payload);
+  console.log(`Parseados ${players.length.toLocaleString()} jogadores (global).`);
+
+  if (eventId) {
+    const eventNames = await fetchEventPlayerNames(eventId, division);
+    const before = players.length;
+    players = players.filter((player) => eventNames.has(player.normalizedName));
+    console.log(
+      `Filtrado para evento ${eventId}: ${players.length.toLocaleString()} de ${before.toLocaleString()} jogadores.`
+    );
+  }
 
   if (players.length === 0) {
     console.error("Nenhum jogador parseado — abortando.");
@@ -93,7 +133,8 @@ async function main() {
   }
 
   const compact = compactCpPlayers(players);
-  const chunks = chunkCompactPlayers(compact);
+  const maxChunkBytes = eventId ? 80_000 : 55_000;
+  const chunks = chunkCompactPlayers(compact, maxChunkBytes);
   console.log(`Enviando ${chunks.length} chunk(s) para ${APP_URL} ...`);
 
   for (let i = 0; i < chunks.length; i++) {
