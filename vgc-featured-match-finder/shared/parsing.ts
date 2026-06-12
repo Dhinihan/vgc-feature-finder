@@ -368,6 +368,71 @@ export function extractPairingsForRoundRaw(
   return pairings.sort((a, b) => (a.tableNumber ?? 99999) - (b.tableNumber ?? 99999));
 }
 
+
+
+export type ParsedStandings = {
+  standings: Array<Record<string, unknown>>;
+  currentRound: number;
+  pairings: ParsedTournamentRound["pairings"];
+};
+
+export function parseStandingsOnce(payload: string, roundNumber?: number): ParsedStandings {
+  const trimmed = payload.trim();
+
+  if (!trimmed.startsWith("[")) {
+    throw new Error("pairings payload must be JSON standings array");
+  }
+
+  if (shouldUseRawPairingsParser(trimmed)) {
+    const currentRound = roundNumber ?? detectCurrentRoundFromRawJson(trimmed);
+    const pairings = extractPairingsForRoundRaw(trimmed, currentRound);
+    return { standings: [], currentRound, pairings };
+  }
+
+  const standings = JSON.parse(trimmed) as Array<Record<string, unknown>>;
+  const currentRound = roundNumber ?? detectCurrentRound(standings);
+  const pairings = extractPairingsFromStandings(standings, currentRound);
+
+  return { standings, currentRound, pairings };
+}
+
+export function pairingsFromStandings(
+  standings: Array<Record<string, unknown>>,
+  roundNumber: number
+): ParsedTournamentRound["pairings"] {
+  return extractPairingsFromStandings(standings, roundNumber);
+}
+
+export function extractStandingsPlayerNames(payload: string): Set<string> {
+  const trimmed = payload.trim();
+  if (!trimmed.startsWith("[")) {
+    return new Set();
+  }
+
+  if (shouldUseRawPairingsParser(trimmed)) {
+    const names = new Set<string>();
+    for (const match of trimmed.matchAll(STANDING_PLAYER_NAME_PATTERN)) {
+      const label = parsePlayerLabel(match[1]);
+      if (label.displayName) {
+        names.add(normalizePlayerName(label.displayName));
+      }
+    }
+    return names;
+  }
+
+  const standings = JSON.parse(trimmed) as Array<Record<string, unknown>>;
+  const names = new Set<string>();
+
+  for (const row of standings) {
+    const label = parsePlayerLabel(String(row.name ?? ""));
+    if (label.displayName) {
+      names.add(normalizePlayerName(label.displayName));
+    }
+  }
+
+  return names;
+}
+
 export function detectCurrentRoundFromPayload(payload: string): number {
   const trimmed = payload.trim();
   if (!trimmed.startsWith("[")) {
@@ -387,29 +452,12 @@ export function countPairingsInRound(payload: string, roundNumber: number): numb
 }
 
 export function parsePairingsForRound(payload: string, roundNumber: number): ParsedTournamentRound["pairings"] {
-  const trimmed = payload.trim();
-  if (!trimmed.startsWith("[")) {
-    throw new Error("pairings payload must be JSON standings array");
-  }
-
-  if (shouldUseRawPairingsParser(trimmed)) {
-    return extractPairingsForRoundRaw(trimmed, roundNumber);
-  }
-
-  const standings = JSON.parse(trimmed) as Array<Record<string, unknown>>;
-  return extractPairingsFromStandings(standings, roundNumber);
+  return parseStandingsOnce(payload, roundNumber).pairings;
 }
 
 
 export function parsePairingsPayload(payload: string): ParsedTournamentRound {
-  const trimmed = payload.trim();
-
-  if (!trimmed.startsWith("[")) {
-    throw new Error("pairings payload must be JSON standings array");
-  }
-
-  const currentRound = detectCurrentRoundFromPayload(trimmed);
-  const pairings = parsePairingsForRound(trimmed, currentRound);
+  const { currentRound, pairings } = parseStandingsOnce(payload);
 
   return {
     title: "",
