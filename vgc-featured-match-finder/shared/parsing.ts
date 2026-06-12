@@ -168,6 +168,208 @@ function dedupeChampionshipPoints(players: ChampionshipPointsPlayer[]): Champion
 }
 
 
+/** PokéData standings JSON exceeds Lakebed row limits; large payloads use regex parsing. */
+export const LARGE_PAIRINGS_PAYLOAD_BYTES = 400_000;
+
+function shouldUseRawPairingsParser(payload: string): boolean {
+  return payload.length >= LARGE_PAIRINGS_PAYLOAD_BYTES;
+}
+
+function parseResultToken(token: string): string | null {
+  if (token === "null") {
+    return null;
+  }
+  return token.replace(/^"|"$/g, "");
+}
+
+function parseTableNumberToken(token: string): number | null {
+  const parsed = Number.parseInt(token.replace(/[^\d]/g, ""), 10);
+  return Number.isNaN(parsed) || parsed <= 0 ? null : parsed;
+}
+
+export function detectCurrentRoundFromRawJson(payload: string): number {
+  let maxRound = 0;
+  let highestPendingRound = 0;
+  const roundPattern =
+    /"(\d+)"\s*:\s*\{\s*"name"\s*:\s*"[^"]*"\s*,\s*"result"\s*:\s*(null|"[^"]*")/g;
+
+  for (const match of payload.matchAll(roundPattern)) {
+    const roundNumber = Number.parseInt(match[1], 10);
+    if (Number.isNaN(roundNumber)) {
+      continue;
+    }
+
+    if (roundNumber > maxRound) {
+      maxRound = roundNumber;
+    }
+
+    if (isPendingResult(parseResultToken(match[2])) && roundNumber > highestPendingRound) {
+      highestPendingRound = roundNumber;
+    }
+  }
+
+  return highestPendingRound > 0 ? highestPendingRound : maxRound;
+}
+
+const STANDING_PLAYER_NAME_PATTERN =
+  /"name"\s*:\s*"([^"]+ \[[A-Z]{2,3}\])"\s*,\s*"(?:placing|record)"/g;
+
+export function buildTournamentRecordIndexRaw(payload: string): Map<string, string> {
+  const index = new Map<string, string>();
+  const playerPattern =
+    /"name"\s*:\s*"([^"]+ \[[A-Z]{2,3}\])"\s*,\s*(?:"placing"\s*:\s*\d+\s*,\s*)?"record"\s*:\s*\{\s*"wins"\s*:\s*(\d+)\s*,\s*"losses"\s*:\s*(\d+)\s*,\s*"ties"\s*:\s*(\d+)/g;
+
+  for (const match of payload.matchAll(playerPattern)) {
+    const label = parsePlayerLabel(match[1]);
+    const formatted = formatTournamentRecord({
+      wins: match[2],
+      losses: match[3],
+      ties: match[4]
+    });
+
+    if (formatted) {
+      index.set(tournamentRecordKey(label.displayName, label.country), formatted);
+    }
+  }
+
+  return index;
+}
+
+export function mergeTournamentRecordIndexes(
+  left: Map<string, string>,
+  right: Map<string, string>
+): Map<string, string> {
+  const merged = new Map(left);
+  for (const [key, value] of right) {
+    merged.set(key, value);
+  }
+  return merged;
+}
+
+export function mergeExtractedPairings(
+  existing: ParsedTournamentRound["pairings"],
+  incoming: ParsedTournamentRound["pairings"],
+  seen: Set<string>,
+  roundNumber: number
+): ParsedTournamentRound["pairings"] {
+  for (const pairing of incoming) {
+    const playerSide = normalizePlayerName(pairing.playerA.displayName);
+    const roundKey = String(roundNumber);
+
+    if (pairing.isBye) {
+      const byeKey = `bye:${playerSide}:${roundKey}`;
+      if (seen.has(byeKey)) {
+        continue;
+      }
+      seen.add(byeKey);
+      existing.push(pairing);
+      continue;
+    }
+
+    if (!pairing.playerB) {
+      continue;
+    }
+
+    const opponentSide = normalizePlayerName(pairing.playerB.displayName);
+    const names = [playerSide, opponentSide].sort();
+    const dedupeKey = `${pairing.tableNumber ?? 0}:${names[0]}:${names[1]}`;
+
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+
+    seen.add(dedupeKey);
+    existing.push(pairing);
+  }
+
+  return existing.sort((a, b) => (a.tableNumber ?? 99999) - (b.tableNumber ?? 99999));
+}
+
+export function extractPairingsForRoundRaw(
+  payload: string,
+  roundNumber: number,
+  recordIndex?: Map<string, string>
+): ParsedTournamentRound["pairings"] {
+  const seen = new Set<string>();
+  const pairings: ParsedTournamentRound["pairings"] = [];
+  const index = recordIndex ?? buildTournamentRecordIndexRaw(payload);
+  const roundPattern = new RegExp(
+    `"${roundNumber}"\\s*:\\s*\\{\\s*"name"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"\\s*,\\s*"result"\\s*:\\s*(null|"[^"]*")\\s*,\\s*"table"\\s*:\\s*"?\\s*([^"\\}]*)`
+  );
+
+  for (const match of payload.matchAll(STANDING_PLAYER_NAME_PATTERN)) {
+    const playerName = match[1];
+    const lookAhead = payload.slice(match.index ?? 0, (match.index ?? 0) + 12_000);
+    const roundsIdx = lookAhead.indexOf('"rounds"');
+    if (roundsIdx < 0) {
+      continue;
+    }
+    const roundMatch = lookAhead.slice(roundsIdx).match(roundPattern);
+    if (!roundMatch) {
+      continue;
+    }
+
+    const playerLabel = parsePlayerLabel(playerName);
+    const opponentRaw = roundMatch[1].replace(/\\"/g, '"').trim();
+    const result = parseResultToken(roundMatch[2]);
+    const tableNumber = parseTableNumberToken(roundMatch[3]);
+    const isBye = opponentRaw.toUpperCase() === "BYE" || opponentRaw === "";
+    const playerSide = normalizePlayerName(playerLabel.displayName);
+    const roundKey = String(roundNumber);
+
+    if (isBye) {
+      const byeKey = `bye:${playerSide}:${roundKey}`;
+      if (seen.has(byeKey)) {
+        continue;
+      }
+      seen.add(byeKey);
+
+      pairings.push({
+        tableNumber,
+        playerA: {
+          ...playerLabel,
+          tournamentRecord: lookupTournamentRecord(index, playerLabel)
+        },
+        playerB: null,
+        result: result ?? "W",
+        isPending: isPendingResult(result),
+        isBye: true
+      });
+      continue;
+    }
+
+    const opponentLabel = parsePlayerLabel(opponentRaw);
+    const opponentSide = normalizePlayerName(opponentLabel.displayName);
+    const names = [playerSide, opponentSide].sort();
+    const dedupeKey = `${tableNumber ?? 0}:${names[0]}:${names[1]}`;
+
+    if (seen.has(dedupeKey) || playerSide > opponentSide) {
+      continue;
+    }
+
+    seen.add(dedupeKey);
+
+    pairings.push({
+      tableNumber,
+      playerA: {
+        ...playerLabel,
+        tournamentRecord: lookupTournamentRecord(index, playerLabel)
+      },
+      playerB: {
+        ...opponentLabel,
+        tournamentRecord: lookupTournamentRecord(index, opponentLabel)
+      },
+      result: formatMatchResult(result),
+      isPending: isPendingResult(result),
+      isBye: false
+    });
+  }
+
+  return pairings.sort((a, b) => (a.tableNumber ?? 99999) - (b.tableNumber ?? 99999));
+}
+
+
+
 export type ParsedStandings = {
   standings: Array<Record<string, unknown>>;
   currentRound: number;
@@ -179,6 +381,12 @@ export function parseStandingsOnce(payload: string, roundNumber?: number): Parse
 
   if (!trimmed.startsWith("[")) {
     throw new Error("pairings payload must be JSON standings array");
+  }
+
+  if (shouldUseRawPairingsParser(trimmed)) {
+    const currentRound = roundNumber ?? detectCurrentRoundFromRawJson(trimmed);
+    const pairings = extractPairingsForRoundRaw(trimmed, currentRound);
+    return { standings: [], currentRound, pairings };
   }
 
   const standings = JSON.parse(trimmed) as Array<Record<string, unknown>>;
@@ -201,6 +409,17 @@ export function extractStandingsPlayerNames(payload: string): Set<string> {
     return new Set();
   }
 
+  if (shouldUseRawPairingsParser(trimmed)) {
+    const names = new Set<string>();
+    for (const match of trimmed.matchAll(STANDING_PLAYER_NAME_PATTERN)) {
+      const label = parsePlayerLabel(match[1]);
+      if (label.displayName) {
+        names.add(normalizePlayerName(label.displayName));
+      }
+    }
+    return names;
+  }
+
   const standings = JSON.parse(trimmed) as Array<Record<string, unknown>>;
   const names = new Set<string>();
 
@@ -214,18 +433,28 @@ export function extractStandingsPlayerNames(payload: string): Set<string> {
   return names;
 }
 
-export function countPairingsInRound(payload: string, roundNumber: number): number {
+export function detectCurrentRoundFromPayload(payload: string): number {
   const trimmed = payload.trim();
   if (!trimmed.startsWith("[")) {
     return 0;
   }
 
-  return parseStandingsOnce(trimmed, roundNumber).pairings.length;
+  if (shouldUseRawPairingsParser(trimmed)) {
+    return detectCurrentRoundFromRawJson(trimmed);
+  }
+
+  const standings = JSON.parse(trimmed) as Array<Record<string, unknown>>;
+  return detectCurrentRound(standings);
+}
+
+export function countPairingsInRound(payload: string, roundNumber: number): number {
+  return parsePairingsForRound(payload, roundNumber).length;
 }
 
 export function parsePairingsForRound(payload: string, roundNumber: number): ParsedTournamentRound["pairings"] {
   return parseStandingsOnce(payload, roundNumber).pairings;
 }
+
 
 export function parsePairingsPayload(payload: string): ParsedTournamentRound {
   const { currentRound, pairings } = parseStandingsOnce(payload);
@@ -250,12 +479,29 @@ export function parseEventTitleFromHtml(html: string): string {
 }
 
 export function parseCurrentRoundFromHtml(html: string): number | null {
-  const match = html.match(/Round\s+(\d+)\s*\/\s*(\d+)/i);
-  if (!match) {
-    return null;
+  const patterns = [/Round\s+(\d+)\s*\/\s*(\d+)/i, /-\s*Round\s+(\d+)\s*\/\s*(\d+)/i];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match) {
+      return Number.parseInt(match[1], 10);
+    }
   }
 
-  return Number.parseInt(match[1], 10);
+  return null;
+}
+
+/** Prefer the most up-to-date round when PokéData HTML and JSON disagree. */
+export function resolveCurrentRound(htmlRound: number | null, standingsRound: number): number {
+  if (htmlRound === null) {
+    return standingsRound;
+  }
+
+  if (standingsRound <= 0) {
+    return htmlRound;
+  }
+
+  return Math.max(htmlRound, standingsRound);
 }
 
 export function formatTournamentRecord(record: unknown): string | null {
@@ -313,6 +559,7 @@ function lookupTournamentRecord(
 
 function detectCurrentRound(standings: Array<Record<string, unknown>>): number {
   let maxRound = 0;
+  let highestPendingRound = 0;
 
   for (const player of standings) {
     const rounds = player.rounds;
@@ -320,15 +567,25 @@ function detectCurrentRound(standings: Array<Record<string, unknown>>): number {
       continue;
     }
 
-    for (const key of Object.keys(rounds as Record<string, unknown>)) {
+    for (const [key, roundData] of Object.entries(
+      rounds as Record<string, { result?: string | null }>
+    )) {
       const roundNumber = Number.parseInt(key, 10);
-      if (!Number.isNaN(roundNumber) && roundNumber > maxRound) {
+      if (Number.isNaN(roundNumber)) {
+        continue;
+      }
+
+      if (roundNumber > maxRound) {
         maxRound = roundNumber;
+      }
+
+      if (isPendingResult(roundData?.result) && roundNumber > highestPendingRound) {
+        highestPendingRound = roundNumber;
       }
     }
   }
 
-  return maxRound;
+  return highestPendingRound > 0 ? highestPendingRound : maxRound;
 }
 
 function extractPairingsFromStandings(

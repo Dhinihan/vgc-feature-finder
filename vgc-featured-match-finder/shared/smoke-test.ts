@@ -1,10 +1,14 @@
 import { matchPlayerToChampionshipPoints } from "./match-player";
 import { normalizePlayerName } from "./normalize-player-name";
 import {
+  detectCurrentRoundFromRawJson,
+  extractPairingsForRoundRaw,
   formatTournamentRecord,
   parseChampionshipPointsPayload,
-  parsePairingsPayload
+  parsePairingsPayload,
+  resolveCurrentRound
 } from "./parsing";
+import { needsPairingsRefresh, resolveDisplayRound } from "./round-resolution";
 import { rankPairings, scorePairing } from "./scoring";
 import type { ChampionshipPointsPlayer, Pairing, PlayerOverride } from "./domain";
 
@@ -145,6 +149,57 @@ export function runSmokeTests(): string[] {
     }
   ]);
 
+  assert(resolveCurrentRound(9, 8) === 9, "html round ahead of json");
+  assert(resolveCurrentRound(8, 9) === 9, "json round ahead of html");
+  assert(resolveCurrentRound(null, 4) === 4, "json-only round");
+
+  const liveRoundPayload = JSON.stringify([
+    {
+      name: "Top [US]",
+      record: { wins: 8, losses: 0, ties: 0 },
+      rounds: {
+        "8": { name: "Rival [US]", result: "W", table: 1 },
+        "9": { name: "Other [US]", result: null, table: 2 }
+      }
+    },
+    {
+      name: "Rival [US]",
+      record: { wins: 7, losses: 1, ties: 0 },
+      rounds: {
+        "8": { name: "Top [US]", result: "L", table: 1 }
+      }
+    }
+  ]);
+  assert(parsePairingsPayload(liveRoundPayload).currentRound === 9, "pending round 9 detected");
+  assert(detectCurrentRoundFromRawJson(liveRoundPayload) === 9, "raw pending round 9");
+  assert(extractPairingsForRoundRaw(liveRoundPayload, 8).length === 1, "raw pairings extraction");
+
+  const placingBeforeRecordPayload = JSON.stringify([
+    {
+      name: "Top [US]",
+      placing: 1,
+      record: { wins: 9, losses: 0, ties: 0 },
+      rounds: {
+        "10": { name: "Rival [US]", result: null, table: 1 }
+      }
+    },
+    {
+      name: "Rival [US]",
+      placing: 2,
+      record: { wins: 7, losses: 2, ties: 0 },
+      rounds: {
+        "10": { name: "Top [US]", result: null, table: 1 }
+      }
+    }
+  ]);
+  const rawWithPlacing = extractPairingsForRoundRaw(placingBeforeRecordPayload, 10);
+  assert(rawWithPlacing.length === 1, "raw pairings with placing field");
+  const rawRecords = [
+    rawWithPlacing[0].playerA.tournamentRecord,
+    rawWithPlacing[0].playerB?.tournamentRecord
+  ].sort();
+  assert(rawRecords[0] === "7-2" && rawRecords[1] === "9-0", "raw records with placing field");
+
   const parsedRound = parsePairingsPayload(pairingsPayload);
   assert(parsedRound.pairings.length === 1, "pairings dedupe");
   assert(parsedRound.pairings[0].result === "W", "pairings keep W/L result");
@@ -152,6 +207,12 @@ export function runSmokeTests(): string[] {
   assert(parsedRound.pairings[0].playerA.tournamentRecord === "1-0", "player A tournament record");
   assert(parsedRound.pairings[0].playerB?.tournamentRecord === "0-1", "player B tournament record");
 
+
+  assert(resolveDisplayRound(11, 10, [10]) === 10, "display falls back to imported round");
+  assert(resolveDisplayRound(11, 11, [11]) === 11, "display uses live when imported");
+  assert(needsPairingsRefresh(11, 10, 72), "refresh when live ahead of display");
+  assert(!needsPairingsRefresh(11, 11, 72), "no refresh when in sync");
+  assert(needsPairingsRefresh(11, 11, 0), "refresh when empty table");
 
   const cpHtml = `<tr><td>1</td><td><div class="player">Dylan Matthews</div></td><td><div class="country">USA</div></td><td class="point"><div class="cp">1332</div><div class="pp">30</div></td></tr>`;
   const fromHtml = parseChampionshipPointsPayload(cpHtml);

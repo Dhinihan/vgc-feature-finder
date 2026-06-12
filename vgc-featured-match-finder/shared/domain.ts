@@ -77,11 +77,17 @@ export type EventDashboard = {
     id: string;
     externalEventId: string;
     title: string;
+    /** Rodada atual no PokéData (HTML). */
     currentRound: number;
+    /** Rodada das partidas exibidas na tabela (pode ficar atrás enquanto importa). */
+    displayRound: number;
+    /** Última rodada importada com sucesso. */
+    importedRound: number;
     lastRefreshAt: string;
     sourceUrl: string;
     division: string;
   } | null;
+  needsPairingsRefresh: boolean;
   rankedPairings: RankedPairing[];
   stats: {
     totalPairings: number;
