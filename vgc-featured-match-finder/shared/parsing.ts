@@ -168,37 +168,67 @@ function dedupeChampionshipPoints(players: ChampionshipPointsPlayer[]): Champion
 }
 
 
+export type ParsedStandings = {
+  standings: Array<Record<string, unknown>>;
+  currentRound: number;
+  pairings: ParsedTournamentRound["pairings"];
+};
+
+export function parseStandingsOnce(payload: string, roundNumber?: number): ParsedStandings {
+  const trimmed = payload.trim();
+
+  if (!trimmed.startsWith("[")) {
+    throw new Error("pairings payload must be JSON standings array");
+  }
+
+  const standings = JSON.parse(trimmed) as Array<Record<string, unknown>>;
+  const currentRound = roundNumber ?? detectCurrentRound(standings);
+  const pairings = extractPairingsFromStandings(standings, currentRound);
+
+  return { standings, currentRound, pairings };
+}
+
+export function pairingsFromStandings(
+  standings: Array<Record<string, unknown>>,
+  roundNumber: number
+): ParsedTournamentRound["pairings"] {
+  return extractPairingsFromStandings(standings, roundNumber);
+}
+
+export function extractStandingsPlayerNames(payload: string): Set<string> {
+  const trimmed = payload.trim();
+  if (!trimmed.startsWith("[")) {
+    return new Set();
+  }
+
+  const standings = JSON.parse(trimmed) as Array<Record<string, unknown>>;
+  const names = new Set<string>();
+
+  for (const row of standings) {
+    const label = parsePlayerLabel(String(row.name ?? ""));
+    if (label.displayName) {
+      names.add(normalizePlayerName(label.displayName));
+    }
+  }
+
+  return names;
+}
+
 export function countPairingsInRound(payload: string, roundNumber: number): number {
   const trimmed = payload.trim();
   if (!trimmed.startsWith("[")) {
     return 0;
   }
 
-  const standings = JSON.parse(trimmed) as Array<Record<string, unknown>>;
-  return extractPairingsFromStandings(standings, roundNumber).length;
+  return parseStandingsOnce(trimmed, roundNumber).pairings.length;
 }
 
 export function parsePairingsForRound(payload: string, roundNumber: number): ParsedTournamentRound["pairings"] {
-  const trimmed = payload.trim();
-  if (!trimmed.startsWith("[")) {
-    throw new Error("pairings payload must be JSON standings array");
-  }
-
-  const standings = JSON.parse(trimmed) as Array<Record<string, unknown>>;
-  return extractPairingsFromStandings(standings, roundNumber);
+  return parseStandingsOnce(payload, roundNumber).pairings;
 }
 
-
 export function parsePairingsPayload(payload: string): ParsedTournamentRound {
-  const trimmed = payload.trim();
-
-  if (!trimmed.startsWith("[")) {
-    throw new Error("pairings payload must be JSON standings array");
-  }
-
-  const standings = JSON.parse(trimmed) as Array<Record<string, unknown>>;
-  const currentRound = detectCurrentRound(standings);
-  const pairings = extractPairingsFromStandings(standings, currentRound);
+  const { currentRound, pairings } = parseStandingsOnce(payload);
 
   return {
     title: "",
