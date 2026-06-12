@@ -4,7 +4,8 @@
 # Uso:
 #   ./scripts/sync-cp
 #   ./scripts/sync-cp --division seniors
-#   npm run sync-cp
+#   ./scripts/sync-cp --event-id=0000190
+#   npm run sync-cp -- --event-id=0000190
 #
 # Requer CP_IMPORT_SECRET em .env.lakebed.server (copie de .env.lakebed.server.example).
 
