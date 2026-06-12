@@ -19,6 +19,12 @@ import type {
   TournamentPlayer
 } from "../shared/domain";
 import { expandCpPlayers, type CompactCpRow } from "../shared/cp-storage";
+import {
+  chunkCompactPairings,
+  compactPairings,
+  expandPairings,
+  type CompactPairingRow
+} from "../shared/pairing-storage";
 import { createLeaderboardIndex, matchPlayerWithLeaderboardIndex } from "../shared/leaderboard-index";
 import type { LeaderboardIndex } from "../shared/leaderboard-index";
 import { readStoredBoolean } from "../shared/stored-boolean";
@@ -29,9 +35,8 @@ import {
   parseChampionshipPointsPayload,
   parseCurrentRoundFromHtml,
   parseEventTitleFromHtml,
-  countPairingsInRound,
-  parsePairingsForRound,
-  parsePairingsPayload,
+  parseStandingsOnce,
+  pairingsFromStandings,
   parsePlayerLabel
 } from "../shared/parsing";
 import { rankPairings } from "../shared/scoring";
@@ -322,10 +327,109 @@ function buildTournamentPlayer(
   };
 }
 
-function buildPairings(ctx: ServerContext, event: TableRow): Pairing[] {
-  const leaderboardIndex = createLeaderboardIndex(loadChampionshipPoints(ctx));
-  const overrides = loadOverrides(ctx);
+type MatchContext = {
+  leaderboardIndex: LeaderboardIndex;
+  overrides: PlayerOverride[];
+};
+
+function createMatchContext(ctx: ServerContext): MatchContext {
+  return {
+    leaderboardIndex: createLeaderboardIndex(loadChampionshipPoints(ctx)),
+    overrides: loadOverrides(ctx)
+  };
+}
+
+function pairingIdFromParts(
+  eventId: string,
+  roundNumber: number,
+  tableNumber: number | null,
+  playerAName: string,
+  playerBName: string
+): string {
+  return `${eventId}:${roundNumber}:${tableNumber ?? 0}:${normalizePlayerName(playerAName)}:${normalizePlayerName(playerBName)}`;
+}
+
+function loadPairingsFromChunks(
+  ctx: ServerContext,
+  eventId: string,
+  roundNumber: number
+): ReturnType<typeof parseStandingsOnce>["pairings"] | null {
+  const chunkRows = ctx.db.pairingChunks
+    .where("eventId", eventId)
+    .all()
+    .filter((row) => Number.parseInt(String(row.roundNumber), 10) === roundNumber)
+    .sort(
+      (a, b) =>
+        Number.parseInt(String(a.chunkIndex), 10) - Number.parseInt(String(b.chunkIndex), 10)
+    );
+
+  if (chunkRows.length === 0) {
+    return null;
+  }
+
+  const compact: CompactPairingRow[] = [];
+  for (const row of chunkRows) {
+    const parsed = JSON.parse(String(row.body)) as CompactPairingRow[];
+    if (Array.isArray(parsed)) {
+      compact.push(...parsed);
+    }
+  }
+
+  return expandPairings(compact);
+}
+
+function pairingFromParsedRound(
+  eventId: string,
+  roundNumber: number,
+  pairing: ReturnType<typeof parseStandingsOnce>["pairings"][number],
+  leaderboardIndex: LeaderboardIndex,
+  overrides: PlayerOverride[]
+): Pairing {
+  const playerA = buildTournamentPlayer(
+    pairing.playerA.displayName,
+    pairing.playerA.country,
+    pairing.playerA.tournamentRecord,
+    leaderboardIndex,
+    overrides
+  );
+
+  return {
+    id: pairingIdFromParts(
+      eventId,
+      roundNumber,
+      pairing.tableNumber,
+      pairing.playerA.displayName,
+      pairing.playerB?.displayName ?? ""
+    ),
+    eventId,
+    roundNumber,
+    tableNumber: pairing.tableNumber,
+    playerA,
+    playerB: pairing.playerB
+      ? buildTournamentPlayer(
+          pairing.playerB.displayName,
+          pairing.playerB.country,
+          pairing.playerB.tournamentRecord,
+          leaderboardIndex,
+          overrides
+        )
+      : null,
+    result: pairing.result,
+    isPending: pairing.isPending,
+    isBye: pairing.isBye
+  };
+}
+
+function buildPairings(ctx: ServerContext, event: TableRow, matchContext?: MatchContext): Pairing[] {
+  const { leaderboardIndex, overrides } = matchContext ?? createMatchContext(ctx);
   const roundNumber = Number.parseInt(String(event.currentRound), 10) || 0;
+  const fromChunks = loadPairingsFromChunks(ctx, event.id, roundNumber);
+
+  if (fromChunks) {
+    return fromChunks.map((pairing) =>
+      pairingFromParsedRound(event.id, roundNumber, pairing, leaderboardIndex, overrides)
+    );
+  }
 
   return ctx.db.pairings
     .where("eventId", event.id)
@@ -393,6 +497,56 @@ function countUnmatchedPlayers(pairings: RankedPairing[]): {
   return { unmatched: unmatchedNames.size, ambiguous: ambiguousNames.size };
 }
 
+function countUnmatchedFromRawPairings(
+  pairings: ReturnType<typeof parseStandingsOnce>["pairings"],
+  matchContext: MatchContext
+): { unmatched: number; ambiguous: number } {
+  const unmatchedNames = new Set<string>();
+  const ambiguousNames = new Set<string>();
+
+  for (const pairing of pairings) {
+    for (const side of [pairing.playerA, pairing.playerB]) {
+      if (!side) {
+        continue;
+      }
+
+      const matched = matchPlayerWithLeaderboardIndex(
+        side.displayName,
+        side.country,
+        matchContext.leaderboardIndex,
+        matchContext.overrides
+      );
+
+      if (matched.match.status === "not-found") {
+        unmatchedNames.add(normalizePlayerName(side.displayName));
+      }
+
+      if (matched.match.status === "ambiguous") {
+        ambiguousNames.add(normalizePlayerName(side.displayName));
+      }
+    }
+  }
+
+  return { unmatched: unmatchedNames.size, ambiguous: ambiguousNames.size };
+}
+
+function buildRankedPairings(
+  ctx: ServerContext,
+  event: TableRow,
+  matchContext?: MatchContext,
+  options?: { pendingOnly?: boolean }
+): { pairings: Pairing[]; ranked: RankedPairing[] } {
+  const mc = matchContext ?? createMatchContext(ctx);
+  const pairings = buildPairings(ctx, event, mc);
+  let ranked = rankPairings(pairings);
+
+  if (options?.pendingOnly) {
+    ranked = ranked.filter((pairing) => pairing.isPending);
+  }
+
+  return { pairings, ranked };
+}
+
 function buildEventDashboard(
   ctx: ServerContext,
   options: { pendingOnly: boolean }
@@ -413,14 +567,15 @@ function buildEventDashboard(
     };
   }
 
-  const pairings = buildPairings(ctx, event);
-  let ranked = rankPairings(pairings);
+  const matchContext = createMatchContext(ctx);
+  const pairings = buildPairings(ctx, event, matchContext);
+  const allRanked = rankPairings(pairings);
+  let ranked = allRanked;
 
   if (options.pendingOnly) {
-    ranked = ranked.filter((pairing) => pairing.isPending);
+    ranked = allRanked.filter((pairing) => pairing.isPending);
   }
 
-  const allRanked = rankPairings(pairings);
   const { unmatched, ambiguous } = countUnmatchedPlayers(allRanked);
 
   return {
@@ -496,6 +651,14 @@ function isPayloadCacheFresh(row: TableRow | null, ttlMs: number): boolean {
 }
 
 function pairingsImportFresh(ctx: ServerContext, eventId: string): boolean {
+  const chunkRows = ctx.db.pairingChunks.where("eventId", eventId).all();
+  if (chunkRows.length > 0) {
+    const importedAt = Date.parse(String(chunkRows[0].importedAt));
+    if (!Number.isNaN(importedAt) && Date.now() - importedAt < PAIRINGS_CACHE_MS) {
+      return true;
+    }
+  }
+
   const rows = ctx.db.pairings.where("eventId", eventId).all();
   if (rows.length === 0) {
     return false;
@@ -517,46 +680,37 @@ function cpImportSecretMatches(ctx: ServerContext, provided: string | null): boo
   return provided === expected;
 }
 
-function insertPairingRow(
-  ctx: ServerContext,
-  eventId: string,
-  currentRound: number,
-  pairing: {
-    tableNumber: number | null;
-    playerA: { displayName: string; country: string; tournamentRecord: string | null };
-    playerB: { displayName: string; country: string; tournamentRecord: string | null } | null;
-    result: string | null;
-    isPending: boolean;
-    isBye: boolean;
-  },
-  importedAt: string
-): void {
-  const playerALabel = pairing.playerA;
-  const playerBLabel = pairing.playerB;
-
-  ctx.db.pairings.insert({
-    eventId,
-    roundNumber: String(currentRound),
-    tableNumber: pairing.tableNumber === null ? "" : String(pairing.tableNumber),
-    playerAName: playerALabel.displayName,
-    playerANormalizedName: normalizePlayerName(playerALabel.displayName),
-    playerACountry: playerALabel.country,
-    playerARecord: playerALabel.tournamentRecord ?? "",
-    playerBName: playerBLabel ? playerBLabel.displayName : "",
-    playerBNormalizedName: playerBLabel ? normalizePlayerName(playerBLabel.displayName) : "",
-    playerBCountry: playerBLabel ? playerBLabel.country : "",
-    playerBRecord: playerBLabel ? playerBLabel.tournamentRecord ?? "" : "",
-    result: pairing.result ?? "",
-    isPending: pairing.isPending,
-    isBye: pairing.isBye,
-    importedAt
-  });
+function clearPairingChunks(ctx: ServerContext, eventId: string): void {
+  const rows = ctx.db.pairingChunks.where("eventId", eventId).all();
+  deleteAllRows(ctx, "pairingChunks", rows);
 }
 
+function storePairingChunks(
+  ctx: ServerContext,
+  eventId: string,
+  roundNumber: number,
+  pairings: ReturnType<typeof parseStandingsOnce>["pairings"]
+): void {
+  clearPairingChunks(ctx, eventId);
+
+  const importedAt = new Date().toISOString();
+  const chunks = chunkCompactPairings(compactPairings(pairings));
+
+  for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+    ctx.db.pairingChunks.insert({
+      eventId,
+      roundNumber: String(roundNumber),
+      chunkIndex: String(chunkIndex),
+      importedAt,
+      body: JSON.stringify(chunks[chunkIndex])
+    });
+  }
+}
 
 function clearEventPairingData(ctx: ServerContext, eventId: string): void {
   const existingPairings = ctx.db.pairings.where("eventId", eventId).all();
   deleteAllRows(ctx, "pairings", existingPairings);
+  clearPairingChunks(ctx, eventId);
 
   const payloads = ctx.db.sourcePayloads
     .where("source", PAYLOAD_SOURCE.pairingsJson)
@@ -578,19 +732,17 @@ function applyPairingsPayload(
   title: string;
 } {
   const htmlRound = pageHtml ? parseCurrentRoundFromHtml(pageHtml) : null;
-  const standingsRound = parsePairingsPayload(jsonBody).currentRound;
-  const currentRound = htmlRound ?? standingsRound;
-  const pairings = parsePairingsForRound(jsonBody, currentRound);
+  const standingsParsed = parseStandingsOnce(jsonBody);
+  const currentRound = htmlRound ?? standingsParsed.currentRound;
+  const pairings =
+    currentRound === standingsParsed.currentRound
+      ? standingsParsed.pairings
+      : pairingsFromStandings(standingsParsed.standings, currentRound);
   const title = (pageHtml ? parseEventTitleFromHtml(pageHtml) : "") || String(event.title);
+  const matchContext = createMatchContext(ctx);
+  const { unmatched, ambiguous } = countUnmatchedFromRawPairings(pairings, matchContext);
 
-  const existingPairings = ctx.db.pairings.where("eventId", event.id).all();
-  deleteAllRows(ctx, "pairings", existingPairings);
-
-  const importedAt = new Date().toISOString();
-
-  for (const pairing of pairings) {
-    insertPairingRow(ctx, event.id, currentRound, pairing, importedAt);
-  }
+  storePairingChunks(ctx, event.id, currentRound, pairings);
 
   const now = new Date().toISOString();
   ctx.db.events.update(event.id, {
@@ -598,11 +750,6 @@ function applyPairingsPayload(
     title,
     lastRefreshAt: now
   });
-
-  const ranked = rankPairings(
-    buildPairings(ctx, { ...event, currentRound: String(currentRound) })
-  );
-  const { unmatched, ambiguous } = countUnmatchedPlayers(ranked);
 
   return {
     roundNumber: currentRound,
@@ -632,21 +779,20 @@ async function importPairingsForEvent(
   let jsonBody = "";
   let fromCache = false;
   const cached = getLatestSourcePayload(ctx, PAYLOAD_SOURCE.pairingsJson, event.id);
-  const standingsRound = cached ? parsePairingsPayload(String(cached.body)).currentRound : null;
+  const cachedParsed = cached ? parseStandingsOnce(String(cached.body)) : null;
 
   if (
     !options?.force &&
     pairingsImportFresh(ctx, event.id) &&
-    cached &&
-    standingsRound !== null &&
-    countPairingsInRound(String(cached.body), standingsRound) > 0
+    cachedParsed &&
+    cachedParsed.pairings.length > 0
   ) {
-    jsonBody = String(cached.body);
+    jsonBody = String(cached!.body);
     fromCache = true;
     ctx.log.info("pairings served from cache", {
       externalEventId,
-      fetchedAt: String(cached.fetchedAt),
-      roundNumber: standingsRound
+      fetchedAt: String(cached!.fetchedAt),
+      roundNumber: cachedParsed.currentRound
     });
   } else {
     jsonBody = await fetchText(jsonUrl);
@@ -706,6 +852,13 @@ export default capsule({
       isBye: boolean().default(false),
       importedAt: string()
     }),
+    pairingChunks: table({
+      eventId: string(),
+      roundNumber: string(),
+      chunkIndex: string(),
+      importedAt: string(),
+      body: string()
+    }),
     playerOverrides: table({
       tournamentNormalizedName: string(),
       tournamentCountry: string(),
@@ -753,7 +906,8 @@ export default capsule({
         }
       >();
 
-      for (const pairing of rankPairings(buildPairings(serverCtx, event))) {
+      const matchContext = createMatchContext(serverCtx);
+      for (const pairing of buildRankedPairings(serverCtx, event, matchContext).ranked) {
         for (const player of [pairing.playerA, pairing.playerB]) {
           if (!player) {
             continue;
@@ -914,7 +1068,7 @@ export default capsule({
       try {
         const result = await importPairingsForEvent(serverCtx, event, {
           force: true,
-          fetchPageHtml: false
+          fetchPageHtml: true
         });
         const now = new Date().toISOString();
 
