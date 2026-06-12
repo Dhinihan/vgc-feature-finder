@@ -128,7 +128,7 @@ export function App() {
 
   const [eventInput, setEventInput] = useState("");
   const [division, setDivision] = useState("masters");
-  const [filterMode, setFilterMode] = useState<FilterMode>("all");
+  const [filterMode, setFilterMode] = useState<FilterMode>("top25");
   const [statusMessage, setStatusMessage] = useState("");
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [overrideForm, setOverrideForm] = useState({
@@ -323,7 +323,7 @@ export function App() {
             <div className="mt-4 grid gap-3">
               <input
                 className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2"
-                placeholder="0000160 ou URL standingsVGC"
+                placeholder="0000190 ou URL standingsVGC"
                 value={eventInput}
                 onInput={(event) => setEventInput(event.currentTarget.value)}
               />
@@ -386,7 +386,14 @@ export function App() {
 
         <section className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <h2 className="text-lg font-medium">Partidas em destaque</h2>
+            <div>
+              <h2 className="text-lg font-medium">Partidas em destaque</h2>
+              {dashboard.rankedPairings.length > filteredPairings.length ? (
+                <p className="mt-1 text-sm text-slate-400">
+                  Mostrando {filteredPairings.length} de {dashboard.rankedPairings.length} partidas
+                </p>
+              ) : null}
+            </div>
             <div className="flex flex-wrap gap-2 text-sm">
               {(
                 [
