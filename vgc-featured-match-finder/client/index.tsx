@@ -1,5 +1,5 @@
 import { useAuth, useMutation, useQuery } from "lakebed/client";
-import { useMemo, useState } from "preact/hooks";
+import { useEffect, useMemo, useState } from "preact/hooks";
 import type { ChampionshipPointsMeta, EventDashboard } from "../shared/domain";
 
 type UnmatchedPlayer = {
@@ -26,6 +26,7 @@ type FilterMode = "pending" | "finished" | "hide-missing" | "top10" | "top25" | 
 
 const EMPTY_DASHBOARD: EventDashboard = {
   event: null,
+  needsPairingsRefresh: false,
   rankedPairings: [],
   stats: {
     totalPairings: 0,
@@ -107,6 +108,7 @@ export function App() {
   const dashboard: EventDashboard = {
     ...EMPTY_DASHBOARD,
     ...dashboardRaw,
+    needsPairingsRefresh: dashboardRaw?.needsPairingsRefresh ?? false,
     rankedPairings: dashboardRaw?.rankedPairings ?? [],
     stats: { ...EMPTY_DASHBOARD.stats, ...dashboardRaw?.stats }
   };
@@ -115,15 +117,40 @@ export function App() {
   const cpMeta = useQuery<ChampionshipPointsMeta>("championshipPointsMeta");
 
   const configureEvent = useMutation<[string, string, string], { eventId: string }>("configureEvent");
-  const refreshPairings = useMutation<
+  const syncCurrentRound = useMutation<[], { roundNumber: number }>("syncCurrentRound");
+  const fetchPairingsJsonSlice = useMutation<
+    [number, boolean | undefined],
+    { sliceIndex: number; sliceTotal: number; done: boolean }
+  >("fetchPairingsJsonSlice");
+  const preparePairingsImportBegin = useMutation<
+    [],
+    { targetRound: number; parseBatchTotal: number }
+  >("preparePairingsImportBegin");
+  const preparePairingsImportParseBatch = useMutation<
+    [number],
+    { batchIndex: number; parseBatchTotal: number; done: boolean }
+  >("preparePairingsImportParseBatch");
+  const preparePairingsImportFinalize = useMutation<
     [],
     {
       roundNumber: number;
       pairingCount: number;
+      chunkTotal: number;
+      title: string;
+    }
+  >("preparePairingsImportFinalize");
+  const commitPairingsChunk = useMutation<
+    [number],
+    {
+      inserted: number;
+      done: boolean;
+      roundNumber: number;
+      pairingCount: number;
       unmatchedPlayerCount: number;
       ambiguousPlayerCount: number;
+      title: string;
     }
-  >("refreshPairings");
+  >("commitPairingsChunk");
   const savePlayerOverride = useMutation<[string, string, string, string], void>("savePlayerOverride");
 
   const [eventInput, setEventInput] = useState("");
@@ -131,12 +158,24 @@ export function App() {
   const [filterMode, setFilterMode] = useState<FilterMode>("all");
   const [statusMessage, setStatusMessage] = useState("");
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [autoRefreshAttempted, setAutoRefreshAttempted] = useState(false);
   const [overrideForm, setOverrideForm] = useState({
     tournamentNormalizedName: "",
     tournamentCountry: "*",
     leaderboardNormalizedName: "",
     leaderboardCountry: "*"
   });
+
+  useEffect(() => {
+    if (!dashboard.event) {
+      setAutoRefreshAttempted(false);
+      return;
+    }
+
+    void syncCurrentRound().catch(() => {
+      // eventDashboard query also syncs round from PokéData HTML
+    });
+  }, [dashboard.event?.id, dashboard.event?.externalEventId]);
 
   const filteredPairings = useMemo(() => {
     let rows = dashboard.rankedPairings;
@@ -162,13 +201,83 @@ export function App() {
     return rows;
   }, [dashboard.rankedPairings, filterMode]);
 
+  async function importPairingsInChunks(force: boolean): Promise<{
+    roundNumber: number;
+    pairingCount: number;
+    unmatchedPlayerCount: number;
+    ambiguousPlayerCount: number;
+  }> {
+    await syncCurrentRound().catch(() => undefined);
+
+    let sliceTotal = 1;
+    for (let sliceIndex = 0; sliceIndex < sliceTotal; sliceIndex++) {
+      setStatusMessage(`Baixando standings ${sliceIndex + 1}/${sliceTotal}...`);
+      const fetched = await fetchPairingsJsonSlice(sliceIndex, sliceIndex === 0 ? force : false);
+      sliceTotal = fetched.sliceTotal;
+    }
+
+    setStatusMessage("Preparando partidas para importação...");
+    const begun = await preparePairingsImportBegin();
+    for (let batchIndex = 0; batchIndex < begun.parseBatchTotal; batchIndex++) {
+      setStatusMessage(
+        `Analisando standings ${batchIndex + 1}/${begun.parseBatchTotal} (rodada ${begun.targetRound})...`
+      );
+      await preparePairingsImportParseBatch(batchIndex);
+    }
+    const staged = await preparePairingsImportFinalize();
+    let result = {
+      roundNumber: staged.roundNumber,
+      pairingCount: staged.pairingCount,
+      unmatchedPlayerCount: 0,
+      ambiguousPlayerCount: 0
+    };
+
+    for (let chunkIndex = 0; chunkIndex < staged.chunkTotal; chunkIndex++) {
+      setStatusMessage(
+        `Importando partidas ${chunkIndex + 1}/${staged.chunkTotal} (rodada ${staged.roundNumber})...`
+      );
+      let committed;
+      try {
+        committed = await commitPairingsChunk(chunkIndex);
+      } catch (firstError) {
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        try {
+          committed = await commitPairingsChunk(chunkIndex);
+        } catch {
+          throw firstError;
+        }
+      }
+      if (committed.done) {
+        result = {
+          roundNumber: committed.roundNumber,
+          pairingCount: committed.pairingCount,
+          unmatchedPlayerCount: committed.unmatchedPlayerCount,
+          ambiguousPlayerCount: committed.ambiguousPlayerCount
+        };
+      }
+    }
+
+    return result;
+  }
+
   async function onConfigureEvent(event: Event) {
     event.preventDefault();
+    setIsRefreshing(true);
+    setStatusMessage("Configurando evento...");
+
     try {
       await configureEvent(eventInput.trim(), "", division);
-      setStatusMessage("Evento configurado.");
+      await syncCurrentRound().catch(() => undefined);
+      const result = await importPairingsInChunks(true);
+      const cpCount = cpMeta?.playerCount ?? 0;
+      setStatusMessage(
+        `Evento configurado. Rodada ${result.roundNumber}, ${result.pairingCount} partidas. CP no banco: ${formatNumber(cpCount)}.`
+      );
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : "Falha ao configurar evento.");
+      setAutoRefreshAttempted(false);
+    } finally {
+      setIsRefreshing(false);
     }
   }
 
@@ -181,17 +290,37 @@ export function App() {
     setStatusMessage("Atualizando partidas no PokéData...");
 
     try {
-      const result = await refreshPairings();
+      const result = await importPairingsInChunks(true);
       const cpCount = cpMeta?.playerCount ?? 0;
       setStatusMessage(
         `Atualização concluída. Rodada ${result.roundNumber}, ${result.pairingCount} partidas. CP no banco: ${formatNumber(cpCount)}.`
       );
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : "Falha na atualização.");
+      setAutoRefreshAttempted(false);
     } finally {
       setIsRefreshing(false);
     }
   }
+
+  useEffect(() => {
+    if (!dashboard.event || isRefreshing || autoRefreshAttempted) {
+      return;
+    }
+
+    if (!dashboard.needsPairingsRefresh) {
+      return;
+    }
+
+    setAutoRefreshAttempted(true);
+    setStatusMessage("Sincronizando partidas da rodada atual automaticamente...");
+    void onRefreshPairings();
+  }, [
+    dashboard.event?.id,
+    dashboard.needsPairingsRefresh,
+    isRefreshing,
+    autoRefreshAttempted
+  ]);
 
   async function onSaveOverride(event: Event) {
     event.preventDefault();
@@ -251,6 +380,13 @@ export function App() {
           <div>
             <p className="text-xs uppercase tracking-wide text-slate-400">Rodada atual</p>
             <p className="mt-1 text-3xl font-semibold">{dashboard.event?.currentRound ?? "—"}</p>
+            {dashboard.event &&
+            dashboard.event.displayRound > 0 &&
+            dashboard.event.displayRound < dashboard.event.currentRound ? (
+              <p className="mt-1 text-sm text-amber-300">
+                Exibindo rodada {dashboard.event.displayRound} até importar a {dashboard.event.currentRound}.
+              </p>
+            ) : null}
           </div>
           <div>
             <p className="text-xs uppercase tracking-wide text-slate-400">Última atualização</p>
@@ -477,7 +613,9 @@ export function App() {
                   <tr>
                     <td className="px-3 py-6 text-slate-400" colSpan={7}>
                       {dashboard.stats.totalPairings === 0
-                        ? "Nenhuma partida carregada. Configure o evento e clique Atualizar."
+                        ? dashboard.needsPairingsRefresh
+                          ? "Importando partidas da rodada atual..."
+                          : "Nenhuma partida carregada. Configure o evento e clique Atualizar."
                         : "Nenhuma partida neste filtro. Tente o filtro 'Todas' ou desmarque pendentes."}
                     </td>
                   </tr>
